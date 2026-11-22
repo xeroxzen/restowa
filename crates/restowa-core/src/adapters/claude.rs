@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 const MAX_TITLE_CHARS: usize = 80;
 const MAX_TRANSCRIPT_SCAN_LINES: usize = 250;
+const MAX_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ClaudeAdapter {
@@ -104,18 +105,31 @@ impl ClaudeAdapter {
 
     /// Read a Claude Code JSONL transcript line-by-line (stopping early) and
     /// extract the first human user prompt as a single-line title ≤ 80 chars.
+    ///
+    /// Caps per-line memory to `MAX_LINE_BYTES` so huge lines (such as base64
+    /// images or `file-history-snapshot` records) never spike RSS.
     pub fn extract_title_from_transcript(path: &Path) -> Option<String> {
         let file = File::open(path).ok()?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::with_capacity(8 * 1024, file);
+        let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
 
-        for line in reader.lines().take(MAX_TRANSCRIPT_SCAN_LINES) {
-            let Ok(line) = line else {
+        for _ in 0..MAX_TRANSCRIPT_SCAN_LINES {
+            line_buf.clear();
+            let Some(complete) = read_bounded_line(&mut reader, &mut line_buf, MAX_LINE_BYTES)
+            else {
                 break;
+            };
+            if !complete {
+                // Oversized line (e.g. screenshot/snapshot) — skip without parsing.
+                continue;
+            }
+            let Ok(line) = std::str::from_utf8(&line_buf) else {
+                continue;
             };
             if !line.contains("\"user\"") {
                 continue;
             }
-            let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
             if val.get("type").and_then(|v| v.as_str()) != Some("user") {
@@ -142,6 +156,53 @@ impl ClaudeAdapter {
 
     pub fn has_pid_session_file(&self, pid: i32) -> bool {
         self.pid_session_path(pid).is_file()
+    }
+}
+
+/// Read up to `max_bytes` of a single `\n`-terminated line into `out`.
+///
+/// Returns `None` at EOF, `Some(true)` if the entire line fit within
+/// `max_bytes`, or `Some(false)` if the line exceeded `max_bytes` (in which
+/// case the remainder of the line is drained without allocating).
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    max_bytes: usize,
+) -> Option<bool> {
+    let mut saw_any = false;
+    let mut exceeded = false;
+
+    loop {
+        let buf = match reader.fill_buf() {
+            Ok([]) => {
+                return if saw_any { Some(!exceeded) } else { None };
+            }
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        saw_any = true;
+
+        if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            if !exceeded {
+                if out.len() + nl <= max_bytes {
+                    out.extend_from_slice(&buf[..nl]);
+                } else {
+                    exceeded = true;
+                }
+            }
+            reader.consume(nl + 1);
+            return Some(!exceeded);
+        }
+
+        let len = buf.len();
+        if !exceeded {
+            if out.len() + len <= max_bytes {
+                out.extend_from_slice(buf);
+            } else {
+                exceeded = true;
+            }
+        }
+        reader.consume(len);
     }
 }
 

@@ -342,13 +342,13 @@ Ship in six phases; each ends with something Andile uses daily, and nothing star
 - [x] `restowa restore` reopens all 3 in the right folders (Ghostty AppleScript backend)
 - [x] Hook handler completes in < 50 ms
 
-**Phase 2: Scanner and the last-boot set**
+**Phase 2: Scanner and the last-boot set** — *Ready for real reboot verification*
 
-- [ ] launchd agent installed via `restowa install --launchd`; `restowa doctor` reports it loaded
-- [ ] Reboot test: 4 live sessions before a restart → `restowa restore --last-boot` restores exactly those 4
-- [ ] Crash test: force-quitting the terminal marks sessions closed within one scan interval, and they still appear in the last-boot set
-- [ ] PID reuse does not mark a dead session live
-- [ ] Scan ≤ 150 ms and ≤ 10 MB peak RSS with 10 sessions
+- [x] launchd agent installed via `restowa install --launchd`; `restowa doctor` reports it loaded
+- [ ] Reboot test: 4 live sessions before a restart → `restowa restore --last-boot` restores exactly those 4 *(requires real macOS reboot)*
+- [x] Crash test: force-quitting the terminal marks sessions closed within one scan interval, and they still appear in the last-boot set
+- [x] PID reuse does not mark a dead session live
+- [x] Scan ≤ 150 ms and ≤ 10 MB peak RSS with 10 sessions
 
 **Phase 3: Codex and OpenCode**
 

@@ -5,6 +5,10 @@ use restowa_core::doctor::{run_doctor, CheckStatus};
 use restowa_core::hooks::{
     handle_claude_hook, install_claude_hooks, uninstall_claude_hooks, ClaudeHookEvent,
 };
+use restowa_core::launchd::{
+    install_launchd_agent, path_points_into_target, uninstall_launchd_agent,
+    DEFAULT_SCAN_INTERVAL_SECS,
+};
 use restowa_core::logging::init_file_logger;
 use restowa_core::model::{Session, SessionStatus, Tool};
 use restowa_core::paths::AppPaths;
@@ -413,8 +417,9 @@ fn cmd_scan(paths: &AppPaths, platform: &dyn Platform, args: &ScanArgs, json: bo
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if args.verbose {
         println!(
-            "scan complete: boot={} procs={} live={} closed={} missing={}",
+            "scan complete: boot={} spool={} procs={} live={} closed={} missing={}",
             report.boot_id,
+            report.spool_imported,
             report.processes_inspected,
             report.live_found,
             report.marked_closed,
@@ -475,6 +480,30 @@ fn maybe_escape_bin(bin: &str) -> String {
     }
 }
 
+fn resolve_launchd_binary_path(explicit: Option<&str>) -> Result<std::path::PathBuf> {
+    if let Some(bin) = explicit {
+        let p = std::path::PathBuf::from(bin);
+        if p.exists() {
+            return Ok(p.canonicalize()?);
+        }
+        return Ok(p);
+    }
+    // Prefer an installed binary on PATH that does not live in target/.
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("restowa");
+            if candidate.is_file() {
+                let resolved = candidate.canonicalize().unwrap_or(candidate);
+                if !path_points_into_target(&resolved.to_string_lossy()) {
+                    return Ok(resolved);
+                }
+            }
+        }
+    }
+    let exe = std::env::current_exe().context("failed to determine current executable path")?;
+    Ok(exe.canonicalize().unwrap_or(exe))
+}
+
 fn cmd_install(paths: &AppPaths, args: &InstallArgs, json: bool) -> Result<u8> {
     let want_hooks = args.hooks || args.all || !args.launchd;
     let want_launchd = args.launchd || args.all;
@@ -490,12 +519,24 @@ fn cmd_install(paths: &AppPaths, args: &InstallArgs, json: bool) -> Result<u8> {
         None
     };
 
+    let launchd_report = if want_launchd {
+        let abs_bin = resolve_launchd_binary_path(args.bin.as_deref())?;
+        Some(install_launchd_agent(
+            paths,
+            &abs_bin,
+            DEFAULT_SCAN_INTERVAL_SECS,
+            true,
+        )?)
+    } else {
+        None
+    };
+
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "hooks": hook_report,
-                "launchd": if want_launchd { "not implemented until Phase 2" } else { "skipped" }
+                "launchd": launchd_report
             }))?
         );
     } else {
@@ -520,8 +561,17 @@ fn cmd_install(paths: &AppPaths, args: &InstallArgs, json: bool) -> Result<u8> {
             println!("  SessionStart: {}", r.command_start);
             println!("  SessionEnd:   {}", r.command_end);
         }
-        if want_launchd {
-            println!("Note: launchd agent installation lands in Phase 2.");
+        if let Some(lr) = launchd_report {
+            println!(
+                "Installed launchd agent at {} (binary: {}, interval: {}s, loaded: {})",
+                lr.plist_path, lr.binary_path, lr.interval_secs, lr.loaded
+            );
+            if lr.points_into_target {
+                eprintln!(
+                    "warning: launchd plist points into target/ ({}); install restowa outside target/ and re-run `restowa install --launchd`",
+                    lr.binary_path
+                );
+            }
         }
     }
 
@@ -530,11 +580,13 @@ fn cmd_install(paths: &AppPaths, args: &InstallArgs, json: bool) -> Result<u8> {
 
 fn cmd_uninstall(paths: &AppPaths, args: &UninstallArgs, json: bool) -> Result<u8> {
     let hook_report = uninstall_claude_hooks(&paths.claude_settings())?;
+    let launchd_report = uninstall_launchd_agent(paths, true)?;
     let mut purged = false;
     if args.purge && paths.registry_db.exists() {
         std::fs::remove_file(&paths.registry_db)?;
         let _ = std::fs::remove_file(paths.registry_db.with_extension("db-wal"));
         let _ = std::fs::remove_file(paths.registry_db.with_extension("db-shm"));
+        let _ = std::fs::remove_file(&paths.spool_file);
         purged = true;
     }
 
@@ -543,6 +595,7 @@ fn cmd_uninstall(paths: &AppPaths, args: &UninstallArgs, json: bool) -> Result<u
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "hooks": hook_report,
+                "launchd": launchd_report,
                 "registry_purged": purged
             }))?
         );
@@ -551,6 +604,12 @@ fn cmd_uninstall(paths: &AppPaths, args: &UninstallArgs, json: bool) -> Result<u
             "Removed {} restowa hook entry/entries from {}",
             hook_report.removed_count, hook_report.settings_path
         );
+        if launchd_report.removed {
+            println!(
+                "Removed launchd agent {} (unloaded: {})",
+                launchd_report.plist_path, launchd_report.unloaded
+            );
+        }
         if purged {
             println!("Purged registry at {}", paths.registry_db.display());
         }

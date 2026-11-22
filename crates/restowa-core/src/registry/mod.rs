@@ -39,9 +39,13 @@ pub struct ScanSessionUpsert {
 
 impl Registry {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_timeout(path, Duration::from_secs(2))
+    }
+
+    pub fn open_with_timeout(path: &Path, busy_timeout: Duration) -> Result<Self> {
         AppPaths::ensure_parent(path)?;
         let conn = Connection::open(path)?;
-        Self::configure_and_migrate(conn)
+        Self::configure_and_migrate(conn, busy_timeout)
     }
 
     pub fn open_read_only(path: &Path) -> Result<Option<Self>> {
@@ -56,12 +60,13 @@ impl Registry {
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::configure_and_migrate(conn)
+        Self::configure_and_migrate(conn, Duration::from_secs(2))
     }
 
-    fn configure_and_migrate(conn: Connection) -> Result<Self> {
-        conn.busy_timeout(Duration::from_secs(2))?;
+    fn configure_and_migrate(conn: Connection, busy_timeout: Duration) -> Result<Self> {
+        conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "cache_size", -512i64)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version < 1 {
             let tx = conn.unchecked_transaction()?;
@@ -80,14 +85,22 @@ impl Registry {
         Ok(())
     }
 
-    /// Return the most recent boot_id strictly older than `current_boot_id`.
+    /// Return the most recent earlier boot that had at least one non-hidden
+    /// live/closed session.
     pub fn previous_boot_id(&self, current_boot_id: &str) -> Result<Option<String>> {
         let boot: Option<String> = self
             .conn
             .query_row(
-                "SELECT boot_id FROM boots
-                 WHERE boot_id != ?1
-                 ORDER BY first_seen DESC
+                "SELECT b.boot_id
+                 FROM boots b
+                 WHERE b.boot_id != ?1
+                   AND EXISTS (
+                       SELECT 1 FROM sessions s
+                       WHERE s.last_boot_id = b.boot_id
+                         AND s.hidden = 0
+                         AND s.status IN ('live', 'closed')
+                   )
+                 ORDER BY b.first_seen DESC
                  LIMIT 1",
                 params![current_boot_id],
                 |r| r.get(0),
@@ -97,6 +110,10 @@ impl Registry {
     }
 
     /// Upsert a session started via hook (`source = 'hook'`).
+    ///
+    /// When a new `session_id` starts for the same `(pid, pid_start_us)` (e.g.
+    /// after `/clear`), mark the old row `closed`, clear its PID, and set
+    /// `last_boot_id = NULL` so it is excluded from the last-boot set.
     /// Preserves user-controlled fields (`title`, `pinned`, `hidden`) and `first_seen`.
     pub fn upsert_hook_start(&mut self, input: &HookSessionUpsert) -> Result<()> {
         let key = Session::make_key(input.tool, &input.session_id);
@@ -105,6 +122,19 @@ impl Registry {
             "INSERT OR IGNORE INTO boots (boot_id, first_seen) VALUES (?1, ?2)",
             params![&input.boot_id, input.now],
         )?;
+        if let (Some(pid), Some(pid_start_us)) = (input.pid, input.pid_start_us) {
+            tx.execute(
+                "UPDATE sessions
+                 SET status = 'closed',
+                     pid = NULL,
+                     pid_start_us = NULL,
+                     last_boot_id = NULL
+                 WHERE pid = ?1
+                   AND pid_start_us = ?2
+                   AND key != ?3",
+                params![pid, pid_start_us, key],
+            )?;
+        }
         tx.execute(
             "INSERT INTO sessions (
                 key, tool, session_id, cwd, title, transcript,
@@ -141,7 +171,10 @@ impl Registry {
     }
 
     /// Mark a session closed via hook (`SessionEnd`).
-    /// Keeps `last_seen_live` and `last_boot_id` intact.
+    ///
+    /// Keeps `last_seen_live` and `last_boot_id` intact unless
+    /// `exclude_from_last_boot` is true (e.g. `reason == "clear"`).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_hook_end(
         &mut self,
         tool: Tool,
@@ -150,8 +183,14 @@ impl Registry {
         transcript: Option<&str>,
         boot_id: &str,
         now: i64,
+        exclude_from_last_boot: bool,
     ) -> Result<()> {
         let key = Session::make_key(tool, session_id);
+        let insert_boot_id = if exclude_from_last_boot {
+            None
+        } else {
+            Some(boot_id)
+        };
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO boots (boot_id, first_seen) VALUES (?1, ?2)",
@@ -173,7 +212,8 @@ impl Registry {
                 pid = NULL,
                 pid_start_us = NULL,
                 status = 'closed',
-                source = 'hook'",
+                source = 'hook',
+                last_boot_id = CASE WHEN ?8 THEN NULL ELSE sessions.last_boot_id END",
             params![
                 key,
                 tool.as_str(),
@@ -181,7 +221,8 @@ impl Registry {
                 cwd,
                 transcript,
                 now,
-                boot_id
+                insert_boot_id,
+                i64::from(exclude_from_last_boot),
             ],
         )?;
         tx.commit()?;
@@ -554,5 +595,43 @@ mod tests {
         let restore_set = reg.list_last_boot(prev.as_deref()).unwrap();
         let ids: Vec<&str> = restore_set.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(ids, vec!["s-boot2", "s-boot1-pinned"]);
+    }
+
+    #[test]
+    fn previous_boot_skips_earlier_boots_without_sessions() {
+        let mut reg = Registry::open_in_memory().unwrap();
+        reg.record_boot("boot-1", 100).unwrap();
+        reg.record_boot("boot-2-empty", 200).unwrap();
+        reg.record_boot("boot-3-missing-only", 250).unwrap();
+        reg.record_boot("boot-4-current", 300).unwrap();
+
+        reg.upsert_hook_start(&HookSessionUpsert {
+            tool: Tool::Claude,
+            session_id: "s-boot1".to_string(),
+            cwd: "/tmp/a".to_string(),
+            transcript: None,
+            pid: Some(10),
+            pid_start_us: Some(100),
+            boot_id: "boot-1".to_string(),
+            now: 110,
+        })
+        .unwrap();
+
+        // boot-3 only has a missing session -> does not qualify
+        reg.upsert_hook_start(&HookSessionUpsert {
+            tool: Tool::Claude,
+            session_id: "s-boot3-missing".to_string(),
+            cwd: "/tmp/b".to_string(),
+            transcript: None,
+            pid: None,
+            pid_start_us: None,
+            boot_id: "boot-3-missing-only".to_string(),
+            now: 255,
+        })
+        .unwrap();
+        reg.mark_missing("claude:s-boot3-missing").unwrap();
+
+        let prev = reg.previous_boot_id("boot-4-current").unwrap();
+        assert_eq!(prev.as_deref(), Some("boot-1"));
     }
 }

@@ -90,50 +90,33 @@ impl Platform for MacOsPlatform {
     }
 
     fn list_processes(&self) -> Result<Vec<ProcInfo>> {
+        let mut out = Vec::new();
+        self.for_each_process(&mut |info| out.push(info.clone()))?;
+        Ok(out)
+    }
+
+    fn for_each_process(&self, f: &mut dyn FnMut(&ProcInfo)) -> Result<usize> {
         let pids = pids_by_type(ProcFilter::All)
             .map_err(|e| CoreError::Platform(format!("proc_listallpids failed: {e}")))?;
 
-        let mut out = Vec::with_capacity(pids.len() / 2);
+        let mut scratch = vec![0u8; 64 * 1024];
+        let mut count = 0usize;
         for raw_pid in pids {
             if raw_pid == 0 {
                 continue;
             }
             let pid = raw_pid as i32;
-            if let Some(info) = self.process_info(pid) {
-                out.push(info);
+            if let Some(info) = inspect_pid_with_scratch(pid, &mut scratch) {
+                count += 1;
+                f(&info);
             }
         }
-        Ok(out)
+        Ok(count)
     }
 
     fn process_info(&self, pid: i32) -> Option<ProcInfo> {
-        if pid <= 0 {
-            return None;
-        }
-        let bsd = pidinfo::<BSDInfo>(pid, 0).ok()?;
-        let start_time_us = (bsd.pbi_start_tvsec as i64)
-            .saturating_mul(1_000_000)
-            .saturating_add(bsd.pbi_start_tvusec as i64);
-
-        let exe_path = pidpath(pid).ok().map(PathBuf::from);
-        let argv = read_argv(pid).unwrap_or_default();
-
-        // Skip processes where we cannot inspect either exe_path or argv
-        // (e.g. root/system daemons owned by other users).
-        if exe_path.is_none() && argv.is_empty() {
-            return None;
-        }
-
-        let cwd = read_cwd(pid);
-
-        Some(ProcInfo {
-            pid,
-            ppid: bsd.pbi_ppid as i32,
-            start_time_us,
-            exe_path,
-            argv,
-            cwd,
-        })
+        let mut scratch = vec![0u8; 64 * 1024];
+        inspect_pid_with_scratch(pid, &mut scratch)
     }
 
     fn process_open_files(&self, pid: i32) -> Vec<PathBuf> {
@@ -212,45 +195,95 @@ fn bytes_to_path(bytes: &[u8]) -> Option<PathBuf> {
     }
 }
 
-/// Read `argv` of `pid` using `sysctl(CTL_KERN, KERN_PROCARGS2, pid)`.
+/// Inspect a single PID reusing `scratch` for `KERN_PROCARGS2` to avoid
+/// per-process large buffer allocations.
+fn inspect_pid_with_scratch(pid: i32, scratch: &mut Vec<u8>) -> Option<ProcInfo> {
+    if pid <= 0 {
+        return None;
+    }
+    let bsd = pidinfo::<BSDInfo>(pid, 0).ok()?;
+    let start_time_us = (bsd.pbi_start_tvsec as i64)
+        .saturating_mul(1_000_000)
+        .saturating_add(bsd.pbi_start_tvusec as i64);
+
+    let exe_path = pidpath(pid).ok().map(PathBuf::from);
+    let argv = read_argv_with_scratch(pid, scratch).unwrap_or_default();
+
+    // Skip processes where we cannot inspect either exe_path or argv
+    // (e.g. root/system daemons owned by other users).
+    if exe_path.is_none() && argv.is_empty() {
+        return None;
+    }
+
+    let cwd = read_cwd(pid);
+
+    Some(ProcInfo {
+        pid,
+        ppid: bsd.pbi_ppid as i32,
+        start_time_us,
+        exe_path,
+        argv,
+        cwd,
+    })
+}
+
+/// Read `argv` of `pid` using `sysctl(CTL_KERN, KERN_PROCARGS2, pid)` into a
+/// reused scratch buffer.
 ///
 /// Buffer layout on macOS:
 /// `[argc: i32][exec_path\0][\0...][argv[0]\0][argv[1]\0]...[envp...]`
-fn read_argv(pid: i32) -> Option<Vec<String>> {
+fn read_argv_with_scratch(pid: i32, scratch: &mut Vec<u8>) -> Option<Vec<String>> {
+    const MAX_ARG_LEN: usize = 1024;
+    const MAX_ARGV_ITEMS: usize = 64;
+
     let mib = [CTL_KERN, KERN_PROCARGS2, pid];
-    let mut size: usize = 0;
-    // SAFETY: querying required buffer size with null oldp.
-    let rc = unsafe {
+    let mut size = scratch.len();
+    // SAFETY: `scratch` has length `size`.
+    let mut rc = unsafe {
         sysctl(
             mib.as_ptr(),
             3,
-            std::ptr::null_mut(),
+            scratch.as_mut_ptr().cast::<c_void>(),
             &mut size,
             std::ptr::null(),
             0,
         )
     };
+    if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(12 /* ENOMEM */) {
+        let mut needed: usize = 0;
+        // SAFETY: query required size with null oldp.
+        let qrc = unsafe {
+            sysctl(
+                mib.as_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut needed,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if qrc != 0 || needed < std::mem::size_of::<i32>() || needed > 2 * 1024 * 1024 {
+            return None;
+        }
+        scratch.resize(needed, 0);
+        size = needed;
+        // SAFETY: `scratch` has length `size`.
+        rc = unsafe {
+            sysctl(
+                mib.as_ptr(),
+                3,
+                scratch.as_mut_ptr().cast::<c_void>(),
+                &mut size,
+                std::ptr::null(),
+                0,
+            )
+        };
+    }
     if rc != 0 || size < std::mem::size_of::<i32>() {
         return None;
     }
 
-    let mut buf = vec![0u8; size];
-    // SAFETY: `buf` has length `size`.
-    let rc = unsafe {
-        sysctl(
-            mib.as_ptr(),
-            3,
-            buf.as_mut_ptr().cast::<c_void>(),
-            &mut size,
-            std::ptr::null(),
-            0,
-        )
-    };
-    if rc != 0 || size < std::mem::size_of::<i32>() {
-        return None;
-    }
-    buf.truncate(size);
-
+    let buf = &scratch[..size];
     let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
     if argc <= 0 {
         return Some(Vec::new());
@@ -266,8 +299,9 @@ fn read_argv(pid: i32) -> Option<Vec<String>> {
         idx += 1;
     }
 
-    let mut argv = Vec::with_capacity((argc as usize).min(64));
-    for _ in 0..argc {
+    let limit = (argc as usize).min(MAX_ARGV_ITEMS);
+    let mut argv = Vec::with_capacity(limit.min(16));
+    for _ in 0..limit {
         if idx >= buf.len() {
             break;
         }
@@ -275,7 +309,8 @@ fn read_argv(pid: i32) -> Option<Vec<String>> {
         while idx < buf.len() && buf[idx] != 0 {
             idx += 1;
         }
-        argv.push(String::from_utf8_lossy(&buf[start..idx]).into_owned());
+        let end = idx.min(start + MAX_ARG_LEN);
+        argv.push(String::from_utf8_lossy(&buf[start..end]).into_owned());
         idx += 1; // skip NUL terminator
     }
     Some(argv)

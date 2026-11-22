@@ -16,6 +16,16 @@ pub trait Platform {
     fn process_info(&self, pid: i32) -> Option<ProcInfo>;
     fn process_open_files(&self, pid: i32) -> Vec<PathBuf>;
     fn parent_pid(&self) -> i32;
+
+    /// Stream processes one at a time to keep peak RSS low during scans.
+    fn for_each_process(&self, f: &mut dyn FnMut(&ProcInfo)) -> Result<usize> {
+        let procs = self.list_processes()?;
+        let count = procs.len();
+        for p in &procs {
+            f(p);
+        }
+        Ok(count)
+    }
 }
 
 #[cfg(target_os = "macos")]

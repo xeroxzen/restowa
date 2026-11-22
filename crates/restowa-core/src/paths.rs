@@ -12,6 +12,7 @@ pub struct AppPaths {
     pub home: PathBuf,
     pub data_dir: PathBuf,
     pub registry_db: PathBuf,
+    pub spool_file: PathBuf,
     pub config_file: PathBuf,
     pub log_file: PathBuf,
 }
@@ -29,12 +30,14 @@ impl AppPaths {
     pub fn from_home(home: PathBuf) -> Self {
         let data_dir = home.join("Library/Application Support/restowa");
         let registry_db = data_dir.join("registry.db");
+        let spool_file = data_dir.join("spool.jsonl");
         let config_file = data_dir.join("config.toml");
         let log_file = home.join("Library/Logs/restowa/restowa.log");
         Self {
             home,
             data_dir,
             registry_db,
+            spool_file,
             config_file,
             log_file,
         }

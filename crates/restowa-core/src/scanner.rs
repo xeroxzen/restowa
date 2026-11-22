@@ -1,6 +1,7 @@
 use crate::adapters::{adapters_for_paths, Adapter};
 use crate::error::Result;
-use crate::model::{ProcInfo, Session, SessionRef, SessionSource, SessionStatus};
+use crate::hooks::replay_spool;
+use crate::model::{Session, SessionRef, SessionSource, SessionStatus};
 use crate::paths::AppPaths;
 use crate::platform::Platform;
 use crate::registry::{Registry, ScanSessionUpsert};
@@ -18,29 +19,37 @@ pub struct DiscoveredLiveSession {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScanReport {
     pub boot_id: String,
+    pub spool_imported: usize,
     pub processes_inspected: usize,
     pub live_found: usize,
     pub marked_closed: usize,
     pub marked_missing: usize,
 }
 
+pub struct LiveDiscoverySnapshot {
+    pub processes_inspected: usize,
+    pub proc_starts: HashMap<i32, i64>,
+    pub discovered: Vec<DiscoveredLiveSession>,
+}
+
 /// Discover all currently live sessions from running processes without writing
-/// to the registry. Used by both `restowa scan` and read-only `restowa list`
-/// (so `restowa list` works even before hooks or launchd are installed).
+/// to the registry. Streams processes one-by-one to keep peak RSS well below
+/// the 10 MB scan budget.
 pub fn discover_live_sessions(
     paths: &AppPaths,
     platform: &dyn Platform,
-) -> Result<(Vec<ProcInfo>, Vec<DiscoveredLiveSession>)> {
-    let procs = platform.list_processes()?;
+) -> Result<LiveDiscoverySnapshot> {
     let adapters = adapters_for_paths(paths);
-    let mut found = Vec::new();
+    let mut proc_starts = HashMap::new();
+    let mut discovered = Vec::new();
 
-    for proc_info in &procs {
+    let processes_inspected = platform.for_each_process(&mut |proc_info| {
+        proc_starts.insert(proc_info.pid, proc_info.start_time_us);
         for adapter in &adapters {
             if adapter.matches_process(proc_info) {
                 match adapter.session_for_process(proc_info) {
                     Ok(Some(session_ref)) => {
-                        found.push(DiscoveredLiveSession {
+                        discovered.push(DiscoveredLiveSession {
                             session_ref,
                             pid: proc_info.pid,
                             pid_start_us: proc_info.start_time_us,
@@ -59,9 +68,13 @@ pub fn discover_live_sessions(
                 break;
             }
         }
-    }
+    })?;
 
-    Ok((procs, found))
+    Ok(LiveDiscoverySnapshot {
+        processes_inspected,
+        proc_starts,
+        discovered,
+    })
 }
 
 /// Execute one complete stateless scan pass and persist updates to SQLite.
@@ -73,9 +86,12 @@ pub fn run_scan(paths: &AppPaths, platform: &dyn Platform) -> Result<ScanReport>
     let boot_id = platform.boot_id()?;
     let mut registry = Registry::open(&paths.registry_db)?;
     registry.record_boot(&boot_id, now)?;
+    let spool_imported = replay_spool(paths, &mut registry)?;
 
-    let (procs, discovered) = discover_live_sessions(paths, platform)?;
-    let proc_starts: HashMap<i32, i64> = procs.iter().map(|p| (p.pid, p.start_time_us)).collect();
+    let snapshot = discover_live_sessions(paths, platform)?;
+    let proc_starts = snapshot.proc_starts;
+    let discovered = snapshot.discovered;
+    let processes_inspected = snapshot.processes_inspected;
 
     let mut live_keys = HashSet::new();
     for item in &discovered {
@@ -146,7 +162,8 @@ pub fn run_scan(paths: &AppPaths, platform: &dyn Platform) -> Result<ScanReport>
 
     Ok(ScanReport {
         boot_id,
-        processes_inspected: procs.len(),
+        spool_imported,
+        processes_inspected,
         live_found: discovered.len(),
         marked_closed,
         marked_missing,
@@ -175,8 +192,9 @@ pub fn load_merged_sessions(
         None => Vec::new(),
     };
 
-    let (procs, discovered) = discover_live_sessions(paths, platform)?;
-    let proc_starts: HashMap<i32, i64> = procs.iter().map(|p| (p.pid, p.start_time_us)).collect();
+    let snapshot = discover_live_sessions(paths, platform)?;
+    let proc_starts = snapshot.proc_starts;
+    let discovered = snapshot.discovered;
 
     let adapters = adapters_for_paths(paths);
     let mut by_key: HashMap<String, Session> = HashMap::new();
@@ -258,4 +276,222 @@ fn find_adapter(adapters: &[Box<dyn Adapter>], tool: crate::model::Tool) -> Opti
         .iter()
         .find(|a| a.tool() == tool)
         .map(|a| a.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ProcInfo, Tool};
+    use crate::registry::HookSessionUpsert;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestHome(PathBuf);
+    impl TestHome {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "restowa-scan-test-{}-{}",
+                std::process::id(),
+                n
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct MockPlatform {
+        boot_id: String,
+        procs: Vec<ProcInfo>,
+    }
+
+    impl Platform for MockPlatform {
+        fn boot_id(&self) -> Result<String> {
+            Ok(self.boot_id.clone())
+        }
+        fn list_processes(&self) -> Result<Vec<ProcInfo>> {
+            Ok(self.procs.clone())
+        }
+        fn process_info(&self, pid: i32) -> Option<ProcInfo> {
+            self.procs.iter().find(|p| p.pid == pid).cloned()
+        }
+        fn process_open_files(&self, _pid: i32) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        fn parent_pid(&self) -> i32 {
+            1
+        }
+    }
+
+    #[test]
+    fn crash_marks_session_closed_and_keeps_it_in_last_boot_set() {
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+        let transcript = home.0.join("crashed.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"mode\"}\n").unwrap();
+
+        let mut reg = Registry::open(&paths.registry_db).unwrap();
+        reg.upsert_hook_start(&HookSessionUpsert {
+            tool: Tool::Claude,
+            session_id: "crashed-session-1".into(),
+            cwd: home.0.to_string_lossy().into_owned(),
+            transcript: Some(transcript.to_string_lossy().into_owned()),
+            pid: Some(7777),
+            pid_start_us: Some(1_000_000),
+            boot_id: "boot-1".into(),
+            now: 1000,
+        })
+        .unwrap();
+        drop(reg);
+
+        // Terminal force-quit: PID 7777 vanished with no SessionEnd hook
+        let crashed_platform = MockPlatform {
+            boot_id: "boot-1".into(),
+            procs: Vec::new(),
+        };
+        let report = run_scan(&paths, &crashed_platform).unwrap();
+        assert_eq!(report.marked_closed, 1);
+        assert_eq!(report.marked_missing, 0);
+
+        let reg = Registry::open(&paths.registry_db).unwrap();
+        let s = reg.get_by_key("claude:crashed-session-1").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Closed);
+        assert_eq!(s.pid, None);
+        assert_eq!(s.pid_start_us, None);
+        assert_eq!(s.last_boot_id.as_deref(), Some("boot-1"));
+
+        // After reboot to boot-2, the crashed session is still in the last-boot set
+        let prev = reg.previous_boot_id("boot-2").unwrap();
+        assert_eq!(prev.as_deref(), Some("boot-1"));
+        let last_boot = reg.list_last_boot(prev.as_deref()).unwrap();
+        assert_eq!(last_boot.len(), 1);
+        assert_eq!(last_boot[0].session_id, "crashed-session-1");
+    }
+
+    #[test]
+    fn pid_reuse_does_not_mark_dead_session_live() {
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+        let transcript = home.0.join("reused.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"mode\"}\n").unwrap();
+
+        let mut reg = Registry::open(&paths.registry_db).unwrap();
+        reg.upsert_hook_start(&HookSessionUpsert {
+            tool: Tool::Claude,
+            session_id: "dead-session-pid-reused".into(),
+            cwd: home.0.to_string_lossy().into_owned(),
+            transcript: Some(transcript.to_string_lossy().into_owned()),
+            pid: Some(4242),
+            pid_start_us: Some(1_000_000),
+            boot_id: "boot-1".into(),
+            now: 1000,
+        })
+        .unwrap();
+        drop(reg);
+
+        // Same PID 4242 is now held by an unrelated process with a DIFFERENT start_time_us
+        let reused_platform = MockPlatform {
+            boot_id: "boot-1".into(),
+            procs: vec![ProcInfo {
+                pid: 4242,
+                ppid: 1,
+                start_time_us: 9_999_999,
+                exe_path: Some(PathBuf::from("/usr/bin/python3")),
+                argv: vec!["python3".into(), "-m".into(), "http.server".into()],
+                cwd: Some(PathBuf::from("/tmp")),
+            }],
+        };
+
+        let report = run_scan(&paths, &reused_platform).unwrap();
+        assert_eq!(report.marked_closed, 1);
+
+        let reg = Registry::open(&paths.registry_db).unwrap();
+        let s = reg
+            .get_by_key("claude:dead-session-pid-reused")
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.status, SessionStatus::Closed);
+        assert_eq!(s.pid, None);
+        assert_eq!(s.pid_start_us, None);
+    }
+
+    #[test]
+    fn four_live_sessions_before_reboot_all_appear_in_last_boot_restore_set() {
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+        std::fs::create_dir_all(paths.claude_sessions_dir()).unwrap();
+
+        let mut procs = Vec::new();
+        for i in 1..=4 {
+            let pid = 6000 + i;
+            let sid = format!("boot1-sess-000{i}");
+            let proj = home.0.join(format!("proj-{i}"));
+            std::fs::create_dir_all(&proj).unwrap();
+            let transcript = home.0.join(format!("t-{i}.jsonl"));
+            std::fs::write(&transcript, "{\"type\":\"mode\"}\n").unwrap();
+
+            std::fs::write(
+                paths.claude_sessions_dir().join(format!("{pid}.json")),
+                format!(
+                    r#"{{"pid":{pid},"sessionId":"{sid}","cwd":"{}","kind":"interactive","entrypoint":"cli"}}"#,
+                    proj.display()
+                ),
+            )
+            .unwrap();
+            procs.push(ProcInfo {
+                pid,
+                ppid: 1,
+                start_time_us: 500_000 + (i as i64),
+                exe_path: Some(PathBuf::from(
+                    "/Users/u/.local/share/claude/versions/2.1.330",
+                )),
+                argv: vec!["claude".into()],
+                cwd: Some(proj),
+            });
+        }
+
+        // Scan on boot-1 discovers all 4 live sessions
+        let boot1 = MockPlatform {
+            boot_id: "boot-1".into(),
+            procs,
+        };
+        let r1 = run_scan(&paths, &boot1).unwrap();
+        assert_eq!(r1.live_found, 4);
+
+        // Reboot to boot-2 (empty) then boot-3 (current)
+        let boot2 = MockPlatform {
+            boot_id: "boot-2".into(),
+            procs: Vec::new(),
+        };
+        // Keep transcripts present by also copying to expected paths
+        for i in 1..=4 {
+            let proj = home.0.join(format!("proj-{i}"));
+            let encoded =
+                crate::adapters::claude::ClaudeAdapter::encode_project_dir(&proj.to_string_lossy());
+            let dir = paths.claude_projects_dir().join(encoded);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("boot1-sess-000{i}.jsonl")),
+                "{\"type\":\"mode\"}\n",
+            )
+            .unwrap();
+        }
+        let r2 = run_scan(&paths, &boot2).unwrap();
+        assert_eq!(r2.marked_closed, 4);
+        assert_eq!(r2.marked_missing, 0);
+
+        let reg = Registry::open(&paths.registry_db).unwrap();
+        let prev = reg.previous_boot_id("boot-3").unwrap();
+        assert_eq!(prev.as_deref(), Some("boot-1"));
+        let restore_set = reg.list_last_boot(prev.as_deref()).unwrap();
+        assert_eq!(restore_set.len(), 4);
+    }
 }

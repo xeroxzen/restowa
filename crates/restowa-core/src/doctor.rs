@@ -1,6 +1,7 @@
 use crate::adapters::claude::ClaudeAdapter;
 use crate::adapters::Adapter;
 use crate::hooks::inspect_claude_hooks;
+use crate::launchd::inspect_launchd_agent;
 use crate::paths::AppPaths;
 use crate::platform::Platform;
 use crate::registry::Registry;
@@ -177,19 +178,63 @@ pub fn run_doctor(paths: &AppPaths, platform: &dyn Platform) -> DoctorReport {
         }
     }
 
-    // 5. Launchd agent (installed in Phase 2)
-    let plist = paths.launch_agent_plist();
-    if plist.is_file() {
-        checks.push(DoctorCheck {
-            name: "launchd".to_string(),
-            status: CheckStatus::Ok,
-            detail: format!("agent plist present at {}", plist.display()),
-        });
-    } else {
+    // 5. Spool status
+    if paths.spool_file.is_file() {
+        let len = std::fs::metadata(&paths.spool_file)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if len > 0 {
+            checks.push(DoctorCheck {
+                name: "spool".to_string(),
+                status: CheckStatus::Warn,
+                detail: format!(
+                    "{} has pending spooled hook events ({len} bytes); run `restowa scan` to import",
+                    paths.spool_file.display()
+                ),
+            });
+        }
+    }
+
+    // 6. Launchd agent
+    let launchd = inspect_launchd_agent(paths, true);
+    if !launchd.plist_exists {
         checks.push(DoctorCheck {
             name: "launchd".to_string(),
             status: CheckStatus::Warn,
-            detail: "launchd scan agent not installed yet (Phase 2)".to_string(),
+            detail: "launchd scan agent not installed (run `restowa install --launchd`)"
+                .to_string(),
+        });
+    } else if launchd.points_into_target {
+        let prog = launchd.program_path.as_deref().unwrap_or("<unknown>");
+        checks.push(DoctorCheck {
+            name: "launchd".to_string(),
+            status: CheckStatus::Warn,
+            detail: format!(
+                "launchd plist points into target/ ({prog}); install binary outside target/ and re-run `restowa install --launchd`"
+            ),
+        });
+    } else if !launchd.binary_exists {
+        let prog = launchd.program_path.as_deref().unwrap_or("<missing>");
+        checks.push(DoctorCheck {
+            name: "launchd".to_string(),
+            status: CheckStatus::Error,
+            detail: format!("launchd plist references missing binary: {prog}"),
+        });
+    } else if !launchd.loaded {
+        let prog = launchd.program_path.as_deref().unwrap_or("<unknown>");
+        checks.push(DoctorCheck {
+            name: "launchd".to_string(),
+            status: CheckStatus::Warn,
+            detail: format!(
+                "plist exists ({prog}) but dev.restowa.scan is not loaded (run `restowa install --launchd`)"
+            ),
+        });
+    } else {
+        let prog = launchd.program_path.as_deref().unwrap_or("<unknown>");
+        checks.push(DoctorCheck {
+            name: "launchd".to_string(),
+            status: CheckStatus::Ok,
+            detail: format!("dev.restowa.scan loaded ({prog})"),
         });
     }
 
@@ -254,4 +299,75 @@ fn find_executable(name: &str, fallbacks: &[PathBuf]) -> Option<PathBuf> {
 
 fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Result;
+    use crate::launchd::install_launchd_agent;
+    use crate::model::ProcInfo;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestHome(PathBuf);
+    impl TestHome {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "restowa-doctor-test-{}-{}",
+                std::process::id(),
+                n
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct EmptyPlatform;
+    impl Platform for EmptyPlatform {
+        fn boot_id(&self) -> Result<String> {
+            Ok("100.000001".into())
+        }
+        fn list_processes(&self) -> Result<Vec<ProcInfo>> {
+            Ok(Vec::new())
+        }
+        fn process_info(&self, _pid: i32) -> Option<ProcInfo> {
+            None
+        }
+        fn process_open_files(&self, _pid: i32) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        fn parent_pid(&self) -> i32 {
+            1
+        }
+    }
+
+    #[test]
+    fn doctor_warns_when_launchd_plist_points_into_target() {
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+
+        let target_bin = home.0.join("src/restowa/target/release/restowa");
+        std::fs::create_dir_all(target_bin.parent().unwrap()).unwrap();
+        std::fs::write(&target_bin, b"fake").unwrap();
+
+        install_launchd_agent(&paths, &target_bin, 120, false).unwrap();
+
+        let report = run_doctor(&paths, &EmptyPlatform);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "launchd")
+            .expect("launchd check present");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("target/"));
+    }
 }

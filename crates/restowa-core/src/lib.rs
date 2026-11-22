@@ -3,6 +3,7 @@ pub mod config;
 pub mod doctor;
 pub mod error;
 pub mod hooks;
+pub mod launchd;
 pub mod logging;
 pub mod model;
 pub mod paths;
