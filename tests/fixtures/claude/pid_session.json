@@ -1,0 +1,14 @@
+{
+  "pid": 3964,
+  "sessionId": "5e45591c-0000-4000-8000-000000000001",
+  "cwd": "/Users/dev/Projects/sample-app",
+  "startedAt": 1795075674950,
+  "procStart": "Thu Nov 19 08:07:53 2026",
+  "version": "2.1.326",
+  "kind": "interactive",
+  "entrypoint": "cli",
+  "name": "sample-app-29",
+  "nameSource": "derived",
+  "status": "idle",
+  "updatedAt": 1795223333092
+}

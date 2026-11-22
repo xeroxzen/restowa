@@ -1,0 +1,17 @@
+[package]
+name = "restowa-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+directories.workspace = true
+log.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc.workspace = true

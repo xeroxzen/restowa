@@ -1,0 +1,17 @@
+[package]
+name = "restowa-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "restowa"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+log.workspace = true
+restowa-core = { path = "../restowa-core" }
+serde.workspace = true
+serde_json.workspace = true

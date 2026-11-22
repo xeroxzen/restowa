@@ -1,0 +1,5 @@
+{"type":"mode","mode":"normal","sessionId":"5e45591c-0000-4000-8000-000000000001"}
+{"type":"permission-mode","permissionMode":"default","sessionId":"5e45591c-0000-4000-8000-000000000001"}
+{"type":"file-history-snapshot","messageId":"b2a35b06-0000-4000-8000-000000000005","snapshot":{},"isSnapshotUpdate":false}
+{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"Add audit event schema and wire up migration tests"},"uuid":"b2a35b06-0000-4000-8000-000000000005","timestamp":"2026-10-22T00:41:51.279Z","cwd":"/Users/dev/Projects/sample-app","sessionId":"5e45591c-0000-4000-8000-000000000001","entrypoint":"cli"}
+{"parentUuid":"b2a35b06-0000-4000-8000-000000000005","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Sure, let's inspect the schema."}]},"sessionId":"5e45591c-0000-4000-8000-000000000001"}

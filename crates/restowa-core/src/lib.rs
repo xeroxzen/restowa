@@ -1,0 +1,14 @@
+pub mod adapters;
+pub mod config;
+pub mod doctor;
+pub mod error;
+pub mod hooks;
+pub mod logging;
+pub mod model;
+pub mod paths;
+pub mod platform;
+pub mod registry;
+pub mod restore;
+pub mod scanner;
+pub mod shell;
+pub mod terminal;

@@ -334,13 +334,13 @@ Ship in six phases; each ends with something Andile uses daily, and nothing star
 - [x] Antigravity: how its CLI stores and resumes sessions, or “not resumable”
 - [x] `libproc` returns cwd and open files for these processes without extra permissions
 
-**Phase 1: Claude Code end to end**
+**Phase 1: Claude Code end to end** — *Complete*
 
-- [ ] `restowa install --hooks` merges hooks without touching existing ones and writes a backup
-- [ ] Starting 3 Claude Code sessions in 2 folders produces 3 rows with exact IDs
-- [ ] `restowa list` shows them; `restowa restore --dry-run` prints correct commands
-- [ ] `restowa restore` reopens all 3 in the right folders (Terminal.app is fine if the Ghostty spike failed)
-- [ ] Hook handler completes in < 50 ms
+- [x] `restowa install --hooks` merges hooks without touching existing ones and writes a backup
+- [x] Starting 3 Claude Code sessions in 2 folders produces 3 rows with exact IDs
+- [x] `restowa list` shows them; `restowa restore --dry-run` prints correct commands
+- [x] `restowa restore` reopens all 3 in the right folders (Ghostty AppleScript backend)
+- [x] Hook handler completes in < 50 ms
 
 **Phase 2: Scanner and the last-boot set**
 
