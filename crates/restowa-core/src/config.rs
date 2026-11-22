@@ -60,6 +60,8 @@ impl Default for ToolsConfig {
 pub struct Config {
     #[serde(default = "default_terminal")]
     pub terminal: String,
+    #[serde(default = "default_scan_interval_secs")]
+    pub scan_interval_secs: u64,
     #[serde(default)]
     pub tools: ToolsConfig,
 }
@@ -68,10 +70,15 @@ fn default_terminal() -> String {
     "ghostty".to_string()
 }
 
+fn default_scan_interval_secs() -> u64 {
+    120
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             terminal: default_terminal(),
+            scan_interval_secs: default_scan_interval_secs(),
             tools: ToolsConfig::default(),
         }
     }

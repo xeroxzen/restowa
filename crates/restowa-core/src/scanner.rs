@@ -47,7 +47,7 @@ pub fn discover_live_sessions(
         proc_starts.insert(proc_info.pid, proc_info.start_time_us);
         for adapter in &adapters {
             if adapter.matches_process(proc_info) {
-                match adapter.session_for_process(proc_info) {
+                match adapter.session_for_process(proc_info, platform) {
                     Ok(Some(session_ref)) => {
                         discovered.push(DiscoveredLiveSession {
                             session_ref,
@@ -70,6 +70,20 @@ pub fn discover_live_sessions(
         }
     })?;
 
+    // If two live processes mapped to the same (tool, session_id) via fallback,
+    // flag them as best_guess so ambiguity is never hidden silently.
+    let mut key_counts: HashMap<String, usize> = HashMap::new();
+    for item in &discovered {
+        let key = Session::make_key(item.session_ref.tool, &item.session_ref.session_id);
+        *key_counts.entry(key).or_insert(0) += 1;
+    }
+    for item in &mut discovered {
+        let key = Session::make_key(item.session_ref.tool, &item.session_ref.session_id);
+        if key_counts.get(&key).copied().unwrap_or(0) > 1 {
+            item.session_ref.best_guess = true;
+        }
+    }
+
     Ok(LiveDiscoverySnapshot {
         processes_inspected,
         proc_starts,
@@ -85,7 +99,7 @@ pub fn run_scan(paths: &AppPaths, platform: &dyn Platform) -> Result<ScanReport>
         .unwrap_or(0);
     let boot_id = platform.boot_id()?;
     let mut registry = Registry::open(&paths.registry_db)?;
-    registry.record_boot(&boot_id, now)?;
+    registry.record_boot_scan(&boot_id, now)?;
     let spool_imported = replay_spool(paths, &mut registry)?;
 
     let snapshot = discover_live_sessions(paths, platform)?;
@@ -106,6 +120,7 @@ pub fn run_scan(paths: &AppPaths, platform: &dyn Platform) -> Result<ScanReport>
             pid: item.pid as i64,
             pid_start_us: item.pid_start_us,
             boot_id: boot_id.clone(),
+            best_guess: item.session_ref.best_guess,
             now,
         })?;
     }
@@ -138,6 +153,7 @@ pub fn run_scan(paths: &AppPaths, platform: &dyn Platform) -> Result<ScanReport>
                             pid,
                             pid_start_us: actual_start,
                             boot_id: boot_id.clone(),
+                            best_guess: session.best_guess,
                             now,
                         })?;
                     }
@@ -229,6 +245,10 @@ pub fn load_merged_sessions(
             existing.pid = Some(live.pid as i64);
             existing.pid_start_us = Some(live.pid_start_us);
             existing.last_seen_live = Some(now);
+            existing.ended_by_user = false;
+            if existing.source != SessionSource::Hook {
+                existing.best_guess = live.session_ref.best_guess;
+            }
             if existing.title.is_none() {
                 existing.title = live.session_ref.title_hint;
             }
@@ -252,6 +272,8 @@ pub fn load_merged_sessions(
                     first_seen: now,
                     last_seen_live: Some(now),
                     last_boot_id: boot_id.clone(),
+                    ended_by_user: false,
+                    best_guess: live.session_ref.best_guess,
                     pinned: false,
                     hidden: false,
                 },
@@ -338,6 +360,10 @@ mod tests {
         let transcript = home.0.join("crashed.jsonl");
         std::fs::write(&transcript, "{\"type\":\"mode\"}\n").unwrap();
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(1000);
         let mut reg = Registry::open(&paths.registry_db).unwrap();
         reg.upsert_hook_start(&HookSessionUpsert {
             tool: Tool::Claude,
@@ -347,7 +373,7 @@ mod tests {
             pid: Some(7777),
             pid_start_us: Some(1_000_000),
             boot_id: "boot-1".into(),
-            now: 1000,
+            now,
         })
         .unwrap();
         drop(reg);
@@ -369,9 +395,9 @@ mod tests {
         assert_eq!(s.last_boot_id.as_deref(), Some("boot-1"));
 
         // After reboot to boot-2, the crashed session is still in the last-boot set
-        let prev = reg.previous_boot_id("boot-2").unwrap();
+        let prev = reg.previous_boot_id("boot-2", 120).unwrap();
         assert_eq!(prev.as_deref(), Some("boot-1"));
-        let last_boot = reg.list_last_boot(prev.as_deref()).unwrap();
+        let last_boot = reg.list_last_boot(prev.as_deref(), 120).unwrap();
         assert_eq!(last_boot.len(), 1);
         assert_eq!(last_boot[0].session_id, "crashed-session-1");
     }
@@ -489,9 +515,9 @@ mod tests {
         assert_eq!(r2.marked_missing, 0);
 
         let reg = Registry::open(&paths.registry_db).unwrap();
-        let prev = reg.previous_boot_id("boot-3").unwrap();
+        let prev = reg.previous_boot_id("boot-3", 120).unwrap();
         assert_eq!(prev.as_deref(), Some("boot-1"));
-        let restore_set = reg.list_last_boot(prev.as_deref()).unwrap();
+        let restore_set = reg.list_last_boot(prev.as_deref(), 120).unwrap();
         assert_eq!(restore_set.len(), 4);
     }
 }

@@ -2,6 +2,7 @@ use restowa_core::adapters::claude::ClaudeAdapter;
 use restowa_core::adapters::Adapter;
 use restowa_core::model::ProcInfo;
 use restowa_core::paths::AppPaths;
+use restowa_core::platform::current_platform;
 use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -78,7 +79,11 @@ fn claude_adapter_reads_fixture_pid_file_and_transcript() {
     };
 
     assert!(adapter.matches_process(&proc_info));
-    let resolved = adapter.session_for_process(&proc_info).unwrap().unwrap();
+    let platform = current_platform();
+    let resolved = adapter
+        .session_for_process(&proc_info, &platform)
+        .unwrap()
+        .unwrap();
     assert_eq!(resolved.session_id, "5e45591c-0000-4000-8000-000000000001");
     assert_eq!(resolved.cwd, "/Users/dev/Projects/sample-app");
     assert_eq!(

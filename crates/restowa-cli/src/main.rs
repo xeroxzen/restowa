@@ -7,7 +7,6 @@ use restowa_core::hooks::{
 };
 use restowa_core::launchd::{
     install_launchd_agent, path_points_into_target, uninstall_launchd_agent,
-    DEFAULT_SCAN_INTERVAL_SECS,
 };
 use restowa_core::logging::init_file_logger;
 use restowa_core::model::{Session, SessionStatus, Tool};
@@ -218,7 +217,7 @@ fn run(cli: Cli) -> Result<u8> {
     let platform = current_platform();
 
     match cli.command {
-        Commands::List(args) => cmd_list(&paths, &platform, &args, cli.json),
+        Commands::List(args) => cmd_list(&paths, &config, &platform, &args, cli.json),
         Commands::Restore(args) => cmd_restore(&paths, &config, &platform, &args, cli.json),
         Commands::Scan(args) => cmd_scan(&paths, &platform, &args, cli.json),
         Commands::Hook(_) => Ok(EXIT_OK),
@@ -238,20 +237,26 @@ fn run(cli: Cli) -> Result<u8> {
             reg.set_hidden(k, true)?;
             Ok("forgotten")
         }),
-        Commands::Install(args) => cmd_install(&paths, &args, cli.json),
+        Commands::Install(args) => cmd_install(&paths, &config, &args, cli.json),
         Commands::Uninstall(args) => cmd_uninstall(&paths, &args, cli.json),
         Commands::Doctor => cmd_doctor(&paths, &platform, cli.json),
         Commands::Config(args) => cmd_config(&paths, &config, &args, cli.json),
     }
 }
 
-fn cmd_list(paths: &AppPaths, platform: &dyn Platform, args: &ListArgs, json: bool) -> Result<u8> {
+fn cmd_list(
+    paths: &AppPaths,
+    config: &Config,
+    platform: &dyn Platform,
+    args: &ListArgs,
+    json: bool,
+) -> Result<u8> {
     let mut sessions = if args.last_boot {
         match Registry::open_read_only(&paths.registry_db)? {
             Some(reg) => {
                 let current_boot = platform.boot_id()?;
-                let prev = reg.previous_boot_id(&current_boot)?;
-                reg.list_last_boot(prev.as_deref())?
+                let prev = reg.previous_boot_id(&current_boot, config.scan_interval_secs)?;
+                reg.list_last_boot(prev.as_deref(), config.scan_interval_secs)?
             }
             None => Vec::new(),
         }
@@ -302,11 +307,13 @@ fn print_sessions_table(sessions: &[Session]) {
         let title = truncate_cell(title_raw, 35);
         let seen_ts = s.last_seen_live.unwrap_or(s.first_seen);
         let seen = format_relative_age(now.saturating_sub(seen_ts));
-        let status = if s.pinned {
-            format!("{}*", s.status)
-        } else {
-            s.status.to_string()
-        };
+        let mut status = s.status.to_string();
+        if s.pinned {
+            status.push('*');
+        }
+        if s.best_guess {
+            status.push('?');
+        }
         println!(
             "{:<10} {:<12} {:<20} {:<36} {:<8} {}",
             s.short_id(),
@@ -504,7 +511,7 @@ fn resolve_launchd_binary_path(explicit: Option<&str>) -> Result<std::path::Path
     Ok(exe.canonicalize().unwrap_or(exe))
 }
 
-fn cmd_install(paths: &AppPaths, args: &InstallArgs, json: bool) -> Result<u8> {
+fn cmd_install(paths: &AppPaths, config: &Config, args: &InstallArgs, json: bool) -> Result<u8> {
     let want_hooks = args.hooks || args.all || !args.launchd;
     let want_launchd = args.launchd || args.all;
 
@@ -524,7 +531,7 @@ fn cmd_install(paths: &AppPaths, args: &InstallArgs, json: bool) -> Result<u8> {
         Some(install_launchd_agent(
             paths,
             &abs_bin,
-            DEFAULT_SCAN_INTERVAL_SECS,
+            config.scan_interval_secs,
             true,
         )?)
     } else {

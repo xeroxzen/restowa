@@ -83,7 +83,7 @@ Two tables and a schema version are enough for v1; migrations are plain numbered
 
 ```sql
 PRAGMA journal_mode = WAL;
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 CREATE TABLE sessions (
   key            TEXT PRIMARY KEY,      -- "<tool>:<session_id>"
@@ -99,6 +99,8 @@ CREATE TABLE sessions (
   first_seen     INTEGER NOT NULL,      -- unix seconds
   last_seen_live INTEGER,               -- unix seconds
   last_boot_id   TEXT,                  -- boot ID when last seen live
+  ended_by_user  INTEGER NOT NULL DEFAULT 0, -- 1 when user exited (prompt_input_exit, logout, clear)
+  best_guess     INTEGER NOT NULL DEFAULT 0, -- 1 when scan fallback was ambiguous
   pinned         INTEGER NOT NULL DEFAULT 0,
   hidden         INTEGER NOT NULL DEFAULT 0
 );
@@ -106,16 +108,20 @@ CREATE INDEX idx_sessions_boot ON sessions(last_boot_id);
 CREATE INDEX idx_sessions_cwd  ON sessions(cwd);
 
 CREATE TABLE boots (
-  boot_id    TEXT PRIMARY KEY,          -- kern.boottime as "<sec>.<usec>"
-  first_seen INTEGER NOT NULL
+  boot_id      TEXT PRIMARY KEY,        -- kern.boottime as "<sec>.<usec>"
+  first_seen   INTEGER NOT NULL,
+  last_scan_at INTEGER                  -- unix seconds of the most recent scan in this boot
 );
 ```
 
 **Rules**
 
 - `status = missing` means the tool's session file is gone; never offer it for restore.
-- The restore set after a reboot is `status IN ('live','closed') AND last_boot_id = <previous boot> AND hidden = 0`, unioned with all pinned sessions.
-- Scans only ever change `pid`, `pid_start_us`, `status`, `last_seen_live` and `last_boot_id`. User fields (`title`, `pinned`, `hidden`) change only through the CLI.
+- `boots.last_scan_at` is updated on every scan pass.
+- "Previous boot" (`prev`) is the most recent earlier boot with at least one eligible session.
+- A `SessionEnd` hook with `reason` in `prompt_input_exit`, `logout`, or `clear` sets `ended_by_user = 1` and is always excluded from the automatic restore set. Reason `other`, or no `SessionEnd` (e.g. crash or OS shutdown), leaves `ended_by_user = 0` so the session stays eligible. Resuming or seeing the session live again resets `ended_by_user = 0`.
+- The last-boot restore set is `status IN ('live','closed') AND last_boot_id = prev.boot_id AND hidden = 0 AND ended_by_user = 0 AND last_seen_live >= prev.last_scan_at - (scan_interval + 30s)`, unioned with all non-hidden, non-missing pinned sessions (`pinned = 1`).
+- Scans only ever change `pid`, `pid_start_us`, `status`, `ended_by_user`, `best_guess`, `last_seen_live` and `last_boot_id`. User fields (`title`, `pinned`, `hidden`) change only through the CLI.
 - Writes happen in one short transaction per scan or hook; the UI opens the file read-only.
 
 ## Tool adapters
@@ -350,11 +356,11 @@ Ship in six phases; each ends with something Andile uses daily, and nothing star
 - [x] PID reuse does not mark a dead session live
 - [x] Scan ≤ 150 ms and ≤ 10 MB peak RSS with 10 sessions
 
-**Phase 3: Codex and OpenCode**
+**Phase 3: Codex, OpenCode and Antigravity** — *Complete*
 
-- [ ] Both adapters pass fixture-based unit tests
-- [ ] Two Codex sessions in the same folder resolve to the correct IDs
-- [ ] Ambiguous matches are flagged as best guesses
+- [x] Codex, OpenCode and Antigravity adapters pass fixture-based unit and integration tests
+- [x] Two Codex sessions in the same folder resolve to the correct IDs
+- [x] Ambiguous matches are flagged as best guesses
 
 **Phase 4: Menu bar app**
 
@@ -366,7 +372,6 @@ Ship in six phases; each ends with something Andile uses daily, and nothing star
 
 - [ ] Titles from first prompt; pin, rename and forget in CLI and UI
 - [ ] Homebrew tap `brew install xeroxzen/tap/restowa`; signed and notarised app
-- [ ] Antigravity adapter, if Phase 0 found a resume path
 - [ ] README with a 30-second GIF
 
 ## Risks

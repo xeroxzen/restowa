@@ -489,6 +489,7 @@ dependencies = [
  "clap",
  "log",
  "restowa-core",
+ "rusqlite",
  "serde",
  "serde_json",
 ]

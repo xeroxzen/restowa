@@ -1,5 +1,5 @@
 use crate::adapters::claude::ClaudeAdapter;
-use crate::adapters::Adapter;
+use crate::adapters::{adapters_for_paths, Adapter};
 use crate::hooks::inspect_claude_hooks;
 use crate::launchd::inspect_launchd_agent;
 use crate::paths::AppPaths;
@@ -268,6 +268,11 @@ pub fn run_doctor(paths: &AppPaths, platform: &dyn Platform) -> DoctorReport {
             status: CheckStatus::Ok,
             detail: "Terminal.app fallback available".to_string(),
         });
+    }
+
+    // 7. Adapter-specific external database schema checks (read-only)
+    for adapter in adapters_for_paths(paths) {
+        checks.extend(adapter.doctor_checks());
     }
 
     let has_errors = checks.iter().any(|c| c.status == CheckStatus::Error);

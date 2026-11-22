@@ -63,6 +63,65 @@ impl AppPaths {
         self.claude_dir().join("projects")
     }
 
+    pub fn codex_dir(&self) -> PathBuf {
+        self.home.join(".codex")
+    }
+
+    pub fn codex_sessions_dir(&self) -> PathBuf {
+        self.codex_dir().join("sessions")
+    }
+
+    /// Return the Codex SQLite state database path (`state_5.sqlite`, or the
+    /// highest-numbered `state_*.sqlite` present in `~/.codex/`).
+    pub fn codex_state_db(&self) -> PathBuf {
+        let default = self.codex_dir().join("state_5.sqlite");
+        if default.is_file() {
+            return default;
+        }
+        if let Ok(entries) = std::fs::read_dir(self.codex_dir()) {
+            let mut best: Option<(u32, PathBuf)> = None;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let s = name.to_string_lossy();
+                if let Some(num_str) = s
+                    .strip_prefix("state_")
+                    .and_then(|rest| rest.strip_suffix(".sqlite"))
+                {
+                    if let Ok(num) = num_str.parse::<u32>() {
+                        if best.as_ref().is_none_or(|(b, _)| num > *b) {
+                            best = Some((num, entry.path()));
+                        }
+                    }
+                }
+            }
+            if let Some((_, path)) = best {
+                return path;
+            }
+        }
+        default
+    }
+
+    pub fn opencode_db(&self) -> PathBuf {
+        self.home.join(".local/share/opencode/opencode.db")
+    }
+
+    pub fn antigravity_cli_dir(&self) -> PathBuf {
+        self.home.join(".gemini/antigravity-cli")
+    }
+
+    pub fn antigravity_summaries_db(&self) -> PathBuf {
+        self.antigravity_cli_dir().join("conversation_summaries.db")
+    }
+
+    pub fn antigravity_conversations_dir(&self) -> PathBuf {
+        self.antigravity_cli_dir().join("conversations")
+    }
+
+    pub fn antigravity_last_conversations(&self) -> PathBuf {
+        self.antigravity_cli_dir()
+            .join("cache/last_conversations.json")
+    }
+
     pub fn ghostty_config(&self) -> PathBuf {
         self.home.join(".config/ghostty/config")
     }

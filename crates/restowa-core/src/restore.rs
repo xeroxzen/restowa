@@ -50,12 +50,12 @@ pub fn run_restore(
         }
         selected
     } else if opts.last_boot {
-        select_last_boot_sessions(paths, platform)?
+        select_last_boot_sessions(paths, config, platform)?
     } else {
         // Default: prefer previous boot restore set if one exists with sessions;
         // otherwise select all non-missing, non-hidden sessions (e.g. Phase 1
         // same-boot workflow).
-        let last_boot_set = select_last_boot_sessions(paths, platform)?;
+        let last_boot_set = select_last_boot_sessions(paths, config, platform)?;
         if !last_boot_set.is_empty() {
             last_boot_set
         } else {
@@ -181,13 +181,17 @@ pub fn run_restore(
     Ok(report)
 }
 
-fn select_last_boot_sessions(paths: &AppPaths, platform: &dyn Platform) -> Result<Vec<Session>> {
+fn select_last_boot_sessions(
+    paths: &AppPaths,
+    config: &Config,
+    platform: &dyn Platform,
+) -> Result<Vec<Session>> {
     let Some(reg) = Registry::open_read_only(&paths.registry_db)? else {
         return Ok(Vec::new());
     };
     let current_boot = platform.boot_id()?;
-    let prev_boot = reg.previous_boot_id(&current_boot)?;
-    reg.list_last_boot(prev_boot.as_deref())
+    let prev_boot = reg.previous_boot_id(&current_boot, config.scan_interval_secs)?;
+    reg.list_last_boot(prev_boot.as_deref(), config.scan_interval_secs)
 }
 
 #[cfg(test)]

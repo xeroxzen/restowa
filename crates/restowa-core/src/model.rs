@@ -135,6 +135,8 @@ pub struct Session {
     pub first_seen: i64,
     pub last_seen_live: Option<i64>,
     pub last_boot_id: Option<String>,
+    pub ended_by_user: bool,
+    pub best_guess: bool,
     pub pinned: bool,
     pub hidden: bool,
 }

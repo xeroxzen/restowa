@@ -3,6 +3,7 @@ use crate::config::ToolConfig;
 use crate::error::Result;
 use crate::model::{ProcInfo, Session, SessionRef, Tool};
 use crate::paths::AppPaths;
+use crate::platform::Platform;
 use crate::shell::expand_resume_template;
 use serde::Deserialize;
 use std::fs::File;
@@ -164,7 +165,7 @@ impl ClaudeAdapter {
 /// Returns `None` at EOF, `Some(true)` if the entire line fit within
 /// `max_bytes`, or `Some(false)` if the line exceeded `max_bytes` (in which
 /// case the remainder of the line is drained without allocating).
-fn read_bounded_line<R: BufRead>(
+pub(crate) fn read_bounded_line<R: BufRead>(
     reader: &mut R,
     out: &mut Vec<u8>,
     max_bytes: usize,
@@ -286,7 +287,11 @@ impl Adapter for ClaudeAdapter {
         argv0_is_claude || exe_is_claude
     }
 
-    fn session_for_process(&self, p: &ProcInfo) -> Result<Option<SessionRef>> {
+    fn session_for_process(
+        &self,
+        p: &ProcInfo,
+        _platform: &dyn Platform,
+    ) -> Result<Option<SessionRef>> {
         if let Some(pid_file) = self.read_pid_session(p.pid) {
             let transcript = self.expected_transcript_path(&pid_file.cwd, &pid_file.session_id);
             let transcript_str = Some(transcript.to_string_lossy().into_owned());
@@ -380,6 +385,25 @@ mod tests {
     impl Drop for TestHome {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct EmptyPlatform;
+    impl Platform for EmptyPlatform {
+        fn boot_id(&self) -> Result<String> {
+            Ok("1.0".into())
+        }
+        fn list_processes(&self) -> Result<Vec<ProcInfo>> {
+            Ok(Vec::new())
+        }
+        fn process_info(&self, _pid: i32) -> Option<ProcInfo> {
+            None
+        }
+        fn process_open_files(&self, _pid: i32) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        fn parent_pid(&self) -> i32 {
+            1
         }
     }
 
@@ -509,7 +533,10 @@ mod tests {
             cwd: Some(PathBuf::from(cwd)),
         };
 
-        let resolved = adapter.session_for_process(&proc_info).unwrap().unwrap();
+        let resolved = adapter
+            .session_for_process(&proc_info, &EmptyPlatform)
+            .unwrap()
+            .unwrap();
         assert_eq!(resolved.session_id, sid);
         assert_eq!(resolved.cwd, cwd);
         assert_eq!(
@@ -539,7 +566,10 @@ mod tests {
             cwd: Some(PathBuf::from("/Users/dev/sample-api")),
         };
 
-        let resolved = adapter.session_for_process(&proc_info).unwrap().unwrap();
+        let resolved = adapter
+            .session_for_process(&proc_info, &EmptyPlatform)
+            .unwrap()
+            .unwrap();
         assert_eq!(resolved.session_id, "d9819a06-0000-4000-8000-000000000006");
         assert_eq!(resolved.cwd, "/Users/dev/sample-api");
     }

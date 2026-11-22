@@ -154,7 +154,10 @@ fn apply_spool_event_to_registry(registry: &mut Registry, ev: &SpoolEvent) -> Re
             })?;
         }
         ClaudeHookEvent::SessionEnd => {
-            let exclude_from_last_boot = ev.reason.as_deref() == Some("clear");
+            let ended_by_user = matches!(
+                ev.reason.as_deref(),
+                Some("prompt_input_exit" | "logout" | "clear")
+            );
             registry.record_hook_end(
                 ev.tool,
                 &ev.session_id,
@@ -162,7 +165,7 @@ fn apply_spool_event_to_registry(registry: &mut Registry, ev: &SpoolEvent) -> Re
                 ev.transcript_path.as_deref(),
                 &ev.boot_id,
                 ev.now,
-                exclude_from_last_boot,
+                ended_by_user,
             )?;
         }
     }
@@ -812,7 +815,7 @@ mod tests {
         assert_eq!(new.last_boot_id.as_deref(), Some("boot-1"));
 
         // Verify old session is excluded from last-boot restore set
-        let restore_set = reg.list_last_boot(Some("boot-1")).unwrap();
+        let restore_set = reg.list_last_boot(Some("boot-1"), 120).unwrap();
         let ids: Vec<&str> = restore_set.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(ids, vec!["new-session-2222"]);
     }
@@ -856,11 +859,57 @@ mod tests {
         let reg = Registry::open(&paths.registry_db).unwrap();
         let old = reg.get_by_key("claude:old-clear-seq").unwrap().unwrap();
         assert_eq!(old.status, SessionStatus::Closed);
-        assert_eq!(old.last_boot_id, None);
+        assert!(old.ended_by_user);
 
-        let restore_set = reg.list_last_boot(Some("boot-1")).unwrap();
+        let restore_set = reg.list_last_boot(Some("boot-1"), 120).unwrap();
         assert_eq!(restore_set.len(), 1);
         assert_eq!(restore_set[0].session_id, "new-clear-seq");
+    }
+
+    #[test]
+    fn session_end_reason_other_stays_eligible_while_exit_and_logout_exclude() {
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+        let platform = claude_platform("boot-1", 400, 1000);
+
+        for (sid, reason) in [
+            ("s-exit", "prompt_input_exit"),
+            ("s-logout", "logout"),
+            ("s-other", "other"),
+        ] {
+            let start = format!(
+                r#"{{"session_id":"{sid}","hook_event_name":"SessionStart","source":"startup","cwd":"/tmp/p1"}}"#
+            );
+            handle_claude_hook(&paths, &platform, ClaudeHookEvent::SessionStart, &start).unwrap();
+            let end = format!(
+                r#"{{"session_id":"{sid}","hook_event_name":"SessionEnd","reason":"{reason}","cwd":"/tmp/p1"}}"#
+            );
+            handle_claude_hook(&paths, &platform, ClaudeHookEvent::SessionEnd, &end).unwrap();
+        }
+
+        let reg = Registry::open(&paths.registry_db).unwrap();
+        assert!(
+            reg.get_by_key("claude:s-exit")
+                .unwrap()
+                .unwrap()
+                .ended_by_user
+        );
+        assert!(
+            reg.get_by_key("claude:s-logout")
+                .unwrap()
+                .unwrap()
+                .ended_by_user
+        );
+        assert!(
+            !reg.get_by_key("claude:s-other")
+                .unwrap()
+                .unwrap()
+                .ended_by_user
+        );
+
+        let restore_set = reg.list_last_boot(Some("boot-1"), 120).unwrap();
+        let ids: Vec<&str> = restore_set.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["s-other"]);
     }
 
     #[test]
