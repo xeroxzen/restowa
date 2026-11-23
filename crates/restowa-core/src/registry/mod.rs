@@ -8,6 +8,7 @@ use std::time::Duration;
 
 const MIGRATION_0001: &str = include_str!("migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("migrations/0002_restore_set.sql");
+const MIGRATION_0003: &str = include_str!("migrations/0003_clear_markup_titles.sql");
 
 /// Grace margin added to `scan_interval` when checking whether a session was
 /// still live at the previous boot's final scan.
@@ -88,6 +89,12 @@ impl Registry {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(MIGRATION_0002)?;
             tx.pragma_update(None, "user_version", 2i64)?;
+            tx.commit()?;
+        }
+        if version < 3 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(MIGRATION_0003)?;
+            tx.pragma_update(None, "user_version", 3i64)?;
             tx.commit()?;
         }
         Ok(Self { conn })
@@ -794,6 +801,44 @@ mod tests {
             ids,
             vec!["live-at-last-scan", "killed-by-shutdown", "pinned-forever"]
         );
+    }
+
+    #[test]
+    fn migration_0003_clears_only_markup_titles() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path: PathBuf =
+            std::env::temp_dir().join(format!("restowa-mig-v3-{}-{n}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(MIGRATION_0001).unwrap();
+            conn.execute_batch(MIGRATION_0002).unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+            for (id, title) in [
+                ("s1", "[Image: source: /tmp/a.png]"),
+                ("s2", "<pasted_content id=\"x\"> Read CL…"),
+                ("s3", "Fix the login bug"),
+            ] {
+                conn.execute(
+                    "INSERT INTO sessions (key, tool, session_id, cwd, title, status, source,
+                        first_seen, pinned, hidden)
+                     VALUES (?1, 'claude', ?2, '/tmp', ?3, 'closed', 'scan', 100, 0, 0)",
+                    params![format!("claude:{id}"), id, title],
+                )
+                .unwrap();
+            }
+        }
+
+        let reg = Registry::open(&db_path).unwrap();
+        let title = |k: &str| reg.get_by_key(k).unwrap().unwrap().title;
+        assert_eq!(title("claude:s1"), None);
+        assert_eq!(title("claude:s2"), None);
+        assert_eq!(title("claude:s3").as_deref(), Some("Fix the login bug"));
+        drop(reg);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     }
 
     #[test]

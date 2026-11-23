@@ -146,7 +146,7 @@ impl ClaudeAdapter {
                     if is_synthetic_claude_user_message(trimmed) {
                         continue;
                     }
-                    let clean = normalize_title(trimmed);
+                    let clean = normalize_title(&strip_prompt_markup(trimmed));
                     if !clean.is_empty() {
                         return Some(clean);
                     }
@@ -231,6 +231,62 @@ fn extract_content_text(content: &serde_json::Value) -> Option<String> {
         }
     }
     None
+}
+
+/// Removes markup Claude Code inserts into prompts: image and paste
+/// placeholders (`[Image #1]`, `[Image: source: …]`, `[Pasted text #1 +20 lines]`)
+/// and wrapper tags such as `<pasted_content id="…">`. Text inside tags is kept.
+fn strip_prompt_markup(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    // Each iteration consumes at least one char, so this ends within raw.len() steps.
+    while let Some(c) = rest.chars().next() {
+        let skip = match c {
+            '[' => placeholder_len(rest),
+            '<' => wrapper_tag_len(rest),
+            _ => None,
+        };
+        let consumed = match skip {
+            Some(n) => {
+                out.push(' ');
+                n
+            }
+            None => {
+                out.push(c);
+                c.len_utf8()
+            }
+        };
+        debug_assert!(consumed > 0 && consumed <= rest.len());
+        rest = &rest[consumed..];
+    }
+    out
+}
+
+fn placeholder_len(s: &str) -> Option<usize> {
+    const PREFIXES: [&str; 3] = ["[Image #", "[Image: ", "[Pasted text #"];
+    if !PREFIXES.iter().any(|p| s.starts_with(p)) {
+        return None;
+    }
+    s.find(']').map(|i| i + 1)
+}
+
+/// Length of a `<name ...>` or `</name>` tag at the start of `s`. Only names
+/// with `_` or `-` count, so HTML such as `<div>` in a prompt is left alone.
+fn wrapper_tag_len(s: &str) -> Option<usize> {
+    let body = s.strip_prefix('<')?;
+    let body = body.strip_prefix('/').unwrap_or(body);
+    let name_end = body
+        .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'))
+        .unwrap_or(body.len());
+    let name = &body[..name_end];
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) || !name.contains(['_', '-']) {
+        return None;
+    }
+    let close = s.find('>')?;
+    if s[..close].contains('\n') {
+        return None;
+    }
+    Some(close + 1)
 }
 
 pub fn normalize_title(raw: &str) -> String {
@@ -369,6 +425,53 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn strips_image_and_paste_placeholders_from_titles() {
+        let title = |raw: &str| normalize_title(&strip_prompt_markup(raw));
+        assert_eq!(title("[Image #1] fix the login bug"), "fix the login bug");
+        assert_eq!(title("[Image: source: /tmp/shot.png]"), "");
+        assert_eq!(
+            title("see [Pasted text #2 +40 lines] and fix it"),
+            "see and fix it"
+        );
+        assert_eq!(title("[Images] are fine"), "[Images] are fine");
+    }
+
+    #[test]
+    fn strips_wrapper_tags_but_keeps_their_text() {
+        let title = |raw: &str| normalize_title(&strip_prompt_markup(raw));
+        assert_eq!(
+            title("\n<pasted_content id=\"a0fc\">\nRead the README first.\n</pasted_content>"),
+            "Read the README first."
+        );
+        assert_eq!(
+            title("why does <div> collapse?"),
+            "why does <div> collapse?"
+        );
+        assert_eq!(title("a < b and c-d > e"), "a < b and c-d > e");
+    }
+
+    #[test]
+    fn title_falls_through_to_next_prompt_when_first_is_only_an_image() {
+        let dir = std::env::temp_dir().join(format!(
+            "restowa-title-img-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let lines = [
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"[Image: source: /tmp/a.png]"}]}}"#,
+            r#"{"type":"user","message":{"content":"Port the TCP handshake"}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        assert_eq!(
+            ClaudeAdapter::extract_title_from_transcript(&path).as_deref(),
+            Some("Port the TCP handshake")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     struct TestHome(PathBuf);
     impl TestHome {
