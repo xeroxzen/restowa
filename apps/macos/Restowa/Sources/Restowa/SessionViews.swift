@@ -91,6 +91,12 @@ struct SessionRow: View {
                     .controlSize(.small)
                     .disabled(model.isRestoring)
             }
+            Menu { contextMenu } label: { Image(systemName: "ellipsis.circle") }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .opacity(hovering ? 1 : 0)
+                .help("Actions")
         }
         .contentShape(Rectangle())
         .help("\(session.cwd)\n\(session.key)")
