@@ -192,6 +192,7 @@ pub struct RestoreItem {
     pub session_id: String,
     pub cwd: String,
     pub title: Option<String>,
+    pub best_guess: bool,
     pub resume_command: String,
     pub shell_command: String,
 }

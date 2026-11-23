@@ -1,5 +1,5 @@
 use crate::adapters::claude::{normalize_title, read_bounded_line};
-use crate::adapters::sqlite_ro::{open_external_readonly, verify_table_columns};
+use crate::adapters::sqlite_ro::{open_external_readonly, verify_table_columns, ExternalDbOpen};
 use crate::adapters::Adapter;
 use crate::config::ToolConfig;
 use crate::doctor::{CheckStatus, DoctorCheck};
@@ -8,6 +8,7 @@ use crate::model::{ProcInfo, Session, SessionRef, Tool};
 use crate::paths::AppPaths;
 use crate::platform::Platform;
 use crate::shell::expand_resume_template;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -65,6 +66,14 @@ struct StateThreadRow {
     title: String,
     first_user_message: String,
     name: Option<String>,
+}
+
+enum StateQueryResult {
+    Rows(Vec<StateThreadRow>),
+    /// DB existed but was skipped (e.g. WAL without -shm while tool is running,
+    /// or schema mismatch); caller should fall back and flag `best_guess`.
+    Skipped,
+    NotFound,
 }
 
 impl CodexAdapter {
@@ -185,7 +194,11 @@ impl CodexAdapter {
             if let Some(arr) = val.pointer("/payload/content").and_then(|v| v.as_array()) {
                 for item in arr {
                     if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        let clean = normalize_title(text);
+                        let trimmed = text.trim();
+                        if trimmed.is_empty() || trimmed.starts_with('<') {
+                            continue;
+                        }
+                        let clean = normalize_title(trimmed);
                         if !clean.is_empty() {
                             return Some(clean);
                         }
@@ -196,47 +209,106 @@ impl CodexAdapter {
         None
     }
 
-    /// Query `~/.codex/state_5.sqlite` read-only for recent CLI threads in `cwd`.
-    /// Returns `None` if DB or expected schema is missing (never crashes).
-    fn query_state_threads_for_cwd(&self, cwd: &str) -> Option<Vec<StateThreadRow>> {
-        let db_path = self.paths.codex_state_db();
-        let conn = open_external_readonly(&db_path)?;
-        if verify_table_columns(&conn, "threads", &["id", "rollout_path", "cwd"]).is_err() {
-            return None;
+    fn is_managed_daemon(p: &ProcInfo) -> bool {
+        let is_codex = p.exe_path.as_ref().is_some_and(|exe| {
+            exe.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "codex")
+        }) || p.argv.first().is_some_and(|a| {
+            Path::new(a)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "codex")
+        });
+        is_codex
+            && p.argv.iter().any(|a| a == "app-server")
+            && p.argv.iter().any(|a| a == "--managed-daemon")
+    }
+
+    fn managed_daemon_rollouts_for_cwd(
+        &self,
+        cwd: &str,
+        platform: &dyn Platform,
+    ) -> Vec<RolloutMeta> {
+        let mut daemon_pids = Vec::new();
+        let _ = platform.for_each_process(&mut |proc_info| {
+            if Self::is_managed_daemon(proc_info) {
+                daemon_pids.push(proc_info.pid);
+            }
+        });
+        if daemon_pids.is_empty() {
+            return Vec::new();
         }
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, rollout_path, cwd, title, first_user_message, name
-                 FROM threads
-                 WHERE archived = 0
-                   AND cwd = ?1
-                   AND (source = 'cli' OR source = '')
-                 ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC, id DESC
-                 LIMIT 2",
-            )
-            .ok()?;
-        let rows = stmt
-            .query_map([cwd], |r| {
-                Ok(StateThreadRow {
-                    id: r.get(0)?,
-                    rollout_path: r.get(1)?,
-                    cwd: r.get(2)?,
-                    title: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    first_user_message: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    name: r.get(5)?,
-                })
+
+        let mut seen_paths = HashSet::new();
+        let mut matched: Vec<(SystemTime, RolloutMeta)> = Vec::new();
+        for pid in daemon_pids {
+            for fd_path in platform.process_open_files(pid) {
+                if !is_rollout_path(&fd_path) || !seen_paths.insert(fd_path.clone()) {
+                    continue;
+                }
+                if let Some(meta) = Self::read_rollout_meta(&fd_path) {
+                    if meta.cwd == cwd {
+                        let mtime = std::fs::metadata(&fd_path)
+                            .and_then(|m| m.modified())
+                            .unwrap_or(SystemTime::UNIX_EPOCH);
+                        matched.push((mtime, meta));
+                    }
+                }
+            }
+        }
+        matched.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
+        matched.into_iter().map(|(_, m)| m).collect()
+    }
+
+    fn query_state_threads_for_cwd(&self, cwd: &str, allow_immutable: bool) -> StateQueryResult {
+        let db_path = self.paths.codex_state_db();
+        let conn = match open_external_readonly(&db_path, allow_immutable) {
+            ExternalDbOpen::Opened(c) => c,
+            ExternalDbOpen::NotFound => return StateQueryResult::NotFound,
+            ExternalDbOpen::Skipped => return StateQueryResult::Skipped,
+        };
+        if verify_table_columns(&conn, "threads", &["id", "rollout_path", "cwd"]).is_err() {
+            return StateQueryResult::Skipped;
+        }
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, rollout_path, cwd, title, first_user_message, name
+             FROM threads
+             WHERE archived = 0
+               AND cwd = ?1
+             ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC, id DESC
+             LIMIT 16",
+        ) else {
+            return StateQueryResult::Skipped;
+        };
+        let Ok(rows) = stmt.query_map([cwd], |r| {
+            Ok(StateThreadRow {
+                id: r.get(0)?,
+                rollout_path: r.get(1)?,
+                cwd: r.get(2)?,
+                title: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                first_user_message: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                name: r.get(5)?,
             })
-            .ok()?;
+        }) else {
+            return StateQueryResult::Skipped;
+        };
         let mut out = Vec::new();
         for r in rows.flatten() {
             out.push(r);
         }
-        Some(out)
+        StateQueryResult::Rows(out)
     }
 
-    fn query_state_thread_by_id(&self, session_id: &str) -> Option<StateThreadRow> {
+    fn query_state_thread_by_id(
+        &self,
+        session_id: &str,
+        allow_immutable: bool,
+    ) -> Option<StateThreadRow> {
         let db_path = self.paths.codex_state_db();
-        let conn = open_external_readonly(&db_path)?;
+        let ExternalDbOpen::Opened(conn) = open_external_readonly(&db_path, allow_immutable) else {
+            return None;
+        };
         if verify_table_columns(&conn, "threads", &["id", "rollout_path", "cwd"]).is_err() {
             return None;
         }
@@ -302,7 +374,7 @@ impl CodexAdapter {
             if let Some(meta) = Self::read_rollout_meta(&path) {
                 if meta.cwd == cwd {
                     matches.push(meta);
-                    if matches.len() >= 2 {
+                    if matches.len() >= 16 {
                         break;
                     }
                 }
@@ -349,7 +421,6 @@ impl Adapter for CodexAdapter {
     }
 
     fn matches_process(&self, p: &ProcInfo) -> bool {
-        // Reject IDE extension daemons and Node wrapper scripts (match the real Rust binary).
         if let Some(exe) = &p.exe_path {
             let s = exe.to_string_lossy();
             if s.contains(".cursor/extensions/")
@@ -404,11 +475,13 @@ impl Adapter for CodexAdapter {
         &self,
         p: &ProcInfo,
         platform: &dyn Platform,
+        claimed_ids: &HashSet<String>,
     ) -> Result<Option<SessionRef>> {
         let proc_cwd = p.cwd.as_ref().map(|c| c.to_string_lossy().into_owned());
+        // A Codex process is running right now -> never allow `immutable=1`.
+        let allow_immutable = false;
 
         // 1. Exact: open `rollout-*.jsonl` file descriptor via libproc.
-        //    Handles multiple Codex sessions running in the exact same folder.
         for fd_path in platform.process_open_files(p.pid) {
             if is_rollout_path(&fd_path) {
                 if let Some(meta) = Self::read_rollout_meta(&fd_path) {
@@ -419,7 +492,7 @@ impl Adapter for CodexAdapter {
                     };
                     if !cwd.is_empty() {
                         let title_hint = Self::extract_title_from_rollout(&fd_path).or_else(|| {
-                            self.query_state_thread_by_id(&meta.id)
+                            self.query_state_thread_by_id(&meta.id, allow_immutable)
                                 .and_then(|r| Self::best_title_from_row(&r))
                         });
                         return Ok(Some(SessionRef {
@@ -437,7 +510,7 @@ impl Adapter for CodexAdapter {
 
         // 2. Exact: `codex resume <session_id>` in argv.
         if let Some(session_id) = Self::extract_resume_arg(&p.argv) {
-            if let Some(row) = self.query_state_thread_by_id(&session_id) {
+            if let Some(row) = self.query_state_thread_by_id(&session_id, allow_immutable) {
                 let cwd = if !row.cwd.is_empty() {
                     row.cwd.clone()
                 } else {
@@ -486,42 +559,78 @@ impl Adapter for CodexAdapter {
             return Ok(None);
         };
 
-        // 3. Fallback 1: read-only query against `state_5.sqlite` (threads table).
-        if let Some(rows) = self.query_state_threads_for_cwd(&cwd) {
-            if let Some(first) = rows.first() {
-                let ambiguous = rows.len() > 1;
-                let transcript = if !first.rollout_path.is_empty() {
-                    Some(first.rollout_path.clone())
-                } else {
-                    self.find_rollout_by_id(&first.id)
-                        .map(|p| p.to_string_lossy().into_owned())
-                };
-                let title_hint = Self::best_title_from_row(first).or_else(|| {
-                    transcript
-                        .as_deref()
-                        .and_then(|t| Self::extract_title_from_rollout(Path::new(t)))
-                });
-                return Ok(Some(SessionRef {
-                    tool: Tool::Codex,
-                    session_id: first.id.clone(),
-                    cwd: first.cwd.clone(),
-                    transcript,
-                    title_hint,
-                    best_guess: ambiguous,
-                }));
+        // 2.5. Exact (Codex 0.171+ managed-daemon architecture): open `rollout-*.jsonl`
+        // FDs held by `codex app-server ... --managed-daemon` matching this `cwd`.
+        let daemon_rollouts = self.managed_daemon_rollouts_for_cwd(&cwd, platform);
+        if let Some(meta) = daemon_rollouts
+            .iter()
+            .find(|m| !claimed_ids.contains(&m.id))
+        {
+            let title_hint = self
+                .query_state_thread_by_id(&meta.id, allow_immutable)
+                .and_then(|r| Self::best_title_from_row(&r))
+                .or_else(|| Self::extract_title_from_rollout(&meta.path));
+            return Ok(Some(SessionRef {
+                tool: Tool::Codex,
+                session_id: meta.id.clone(),
+                cwd,
+                transcript: Some(meta.path.to_string_lossy().into_owned()),
+                title_hint,
+                best_guess: false,
+            }));
+        }
+
+        // 3. Fallback 1: read-only query against `state_5.sqlite` (`allow_immutable = false`).
+        let mut db_skipped = false;
+        match self.query_state_threads_for_cwd(&cwd, allow_immutable) {
+            StateQueryResult::Rows(rows) => {
+                if let Some(chosen) = rows
+                    .iter()
+                    .find(|r| !claimed_ids.contains(&r.id))
+                    .or_else(|| rows.first())
+                {
+                    let ambiguous = rows.len() > 1;
+                    let transcript = if !chosen.rollout_path.is_empty() {
+                        Some(chosen.rollout_path.clone())
+                    } else {
+                        self.find_rollout_by_id(&chosen.id)
+                            .map(|p| p.to_string_lossy().into_owned())
+                    };
+                    let title_hint = Self::best_title_from_row(chosen).or_else(|| {
+                        transcript
+                            .as_deref()
+                            .and_then(|t| Self::extract_title_from_rollout(Path::new(t)))
+                    });
+                    return Ok(Some(SessionRef {
+                        tool: Tool::Codex,
+                        session_id: chosen.id.clone(),
+                        cwd: chosen.cwd.clone(),
+                        transcript,
+                        title_hint,
+                        best_guess: ambiguous,
+                    }));
+                }
             }
+            StateQueryResult::Skipped => {
+                db_skipped = true;
+            }
+            StateQueryResult::NotFound => {}
         }
 
         // 4. Fallback 2: newest rollout file in `~/.codex/sessions` matching `cwd`.
         let rollouts = self.find_rollouts_for_cwd(&cwd);
-        if let Some(first) = rollouts.first() {
-            let ambiguous = rollouts.len() > 1;
-            let title_hint = Self::extract_title_from_rollout(&first.path);
+        if let Some(chosen) = rollouts
+            .iter()
+            .find(|m| !claimed_ids.contains(&m.id))
+            .or_else(|| rollouts.first())
+        {
+            let ambiguous = db_skipped || rollouts.len() > 1;
+            let title_hint = Self::extract_title_from_rollout(&chosen.path);
             return Ok(Some(SessionRef {
                 tool: Tool::Codex,
-                session_id: first.id.clone(),
-                cwd: first.cwd.clone(),
-                transcript: Some(first.path.to_string_lossy().into_owned()),
+                session_id: chosen.id.clone(),
+                cwd: chosen.cwd.clone(),
+                transcript: Some(chosen.path.to_string_lossy().into_owned()),
                 title_hint,
                 best_guess: ambiguous,
             }));
@@ -530,20 +639,23 @@ impl Adapter for CodexAdapter {
         Ok(None)
     }
 
-    fn session_exists(&self, s: &Session) -> bool {
+    fn session_exists(&self, s: &Session, tool_running: bool) -> bool {
         if let Some(transcript) = &s.transcript {
             if Path::new(transcript).is_file() {
                 return true;
             }
         }
-        if self.query_state_thread_by_id(&s.session_id).is_some() {
+        if self
+            .query_state_thread_by_id(&s.session_id, !tool_running)
+            .is_some()
+        {
             return true;
         }
         self.find_rollout_by_id(&s.session_id).is_some()
     }
 
-    fn title(&self, s: &Session) -> Option<String> {
-        if let Some(row) = self.query_state_thread_by_id(&s.session_id) {
+    fn title(&self, s: &Session, tool_running: bool) -> Option<String> {
+        if let Some(row) = self.query_state_thread_by_id(&s.session_id, !tool_running) {
             if let Some(t) = Self::best_title_from_row(&row) {
                 return Some(t);
             }
@@ -561,13 +673,13 @@ impl Adapter for CodexAdapter {
         expand_resume_template(&cfg.resume, &s.session_id)
     }
 
-    fn doctor_checks(&self) -> Vec<DoctorCheck> {
+    fn doctor_checks(&self, tool_running: bool) -> Vec<DoctorCheck> {
         let db_path = self.paths.codex_state_db();
         if !db_path.is_file() {
             return Vec::new();
         }
-        let check = match open_external_readonly(&db_path) {
-            Some(conn) => {
+        let check = match open_external_readonly(&db_path, !tool_running) {
+            ExternalDbOpen::Opened(conn) => {
                 match verify_table_columns(&conn, "threads", &["id", "rollout_path", "cwd"]) {
                     Ok(()) => DoctorCheck {
                         name: "schema:codex".to_string(),
@@ -584,10 +696,13 @@ impl Adapter for CodexAdapter {
                     },
                 }
             }
-            None => DoctorCheck {
+            ExternalDbOpen::Skipped | ExternalDbOpen::NotFound => DoctorCheck {
                 name: "schema:codex".to_string(),
                 status: CheckStatus::Warn,
-                detail: format!("could not open {} read-only", db_path.display()),
+                detail: format!(
+                    "skipped {} read-only check (immutable=1 disallowed while codex is running)",
+                    db_path.display()
+                ),
             },
         };
         vec![check]
@@ -597,8 +712,10 @@ impl Adapter for CodexAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{SessionSource, SessionStatus};
     use rusqlite::Connection;
     use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -619,6 +736,10 @@ mod tests {
     }
     impl Drop for TestHome {
         fn drop(&mut self) {
+            let _ = std::fs::set_permissions(
+                self.0.join(".codex"),
+                std::fs::Permissions::from_mode(0o755),
+            );
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
@@ -738,12 +859,13 @@ mod tests {
             cwd: Some(PathBuf::from(cwd)),
         };
 
+        let empty = HashSet::new();
         let s1 = adapter
-            .session_for_process(&p1, &platform)
+            .session_for_process(&p1, &platform, &empty)
             .unwrap()
             .unwrap();
         let s2 = adapter
-            .session_for_process(&p2, &platform)
+            .session_for_process(&p2, &platform, &empty)
             .unwrap()
             .unwrap();
 
@@ -762,27 +884,23 @@ mod tests {
         let paths = AppPaths::from_home(home.0.clone());
         std::fs::create_dir_all(paths.codex_dir()).unwrap();
 
-        // Create a state_5.sqlite with a completely unrelated table (missing `threads`)
         {
             let conn = Connection::open(paths.codex_state_db()).unwrap();
             conn.execute("CREATE TABLE other_table (x INTEGER)", [])
                 .unwrap();
         }
 
-        // Seed 2 rollouts in the same cwd so fallback is ambiguous (best_guess = true)
         let sess_dir = paths.codex_sessions_dir().join("2026/11/22");
         std::fs::create_dir_all(&sess_dir).unwrap();
         let cwd = "/Users/dev/same-dir";
-        for i in 1..=2 {
-            let f = sess_dir.join(format!("rollout-2026-11-22T10-0{i}-00-019a-id-{i}.jsonl"));
-            std::fs::write(
-                &f,
-                format!(
-                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019a-id-{i}\",\"cwd\":\"{cwd}\"}}}}\n"
-                ),
-            )
-            .unwrap();
-        }
+        let f = sess_dir.join("rollout-2026-11-22T10-01-00-019a-id-1.jsonl");
+        std::fs::write(
+            &f,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019a-id-1\",\"cwd\":\"{cwd}\"}}}}\n"
+            ),
+        )
+        .unwrap();
 
         let adapter = CodexAdapter::new(paths);
         let platform = FakePlatform {
@@ -798,17 +916,212 @@ mod tests {
         };
 
         let resolved = adapter
-            .session_for_process(&proc_info, &platform)
+            .session_for_process(&proc_info, &platform, &HashSet::new())
             .unwrap()
             .unwrap();
         assert!(
             resolved.best_guess,
-            "ambiguous fallback should set best_guess"
+            "DB skipped -> fallback must set best_guess"
         );
 
-        let checks = adapter.doctor_checks();
+        let checks = adapter.doctor_checks(false);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, CheckStatus::Warn);
         assert!(checks[0].detail.contains("missing table 'threads'"));
+    }
+
+    #[test]
+    fn wal_db_without_shm_skips_when_codex_running_and_falls_back_with_best_guess_but_uses_immutable_when_idle(
+    ) {
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+        let sess_dir = paths.codex_sessions_dir().join("2026/11/22");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+
+        let cwd = "/Users/dev/immutable-test";
+        let rollout_id = "019a-rollout-fallback";
+        let db_only_id = "019a-db-only";
+        std::fs::write(
+            sess_dir.join(format!("rollout-2026-11-22T10-00-00-{rollout_id}.jsonl")),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{rollout_id}\",\"cwd\":\"{cwd}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        {
+            let conn = Connection::open(paths.codex_state_db()).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, cwd TEXT NOT NULL,
+                    title TEXT NOT NULL, first_user_message TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'cli', archived INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 100, updated_at_ms INTEGER, name TEXT
+                );
+                INSERT INTO threads (id, rollout_path, cwd, title, updated_at, updated_at_ms)
+                VALUES ('{db_only_id}', '', '{cwd}', 'DB Only Title', 200, 200000);"
+            ))
+            .unwrap();
+        }
+        let _ = std::fs::remove_file(paths.codex_dir().join("state_5.sqlite-shm"));
+        let _ = std::fs::remove_file(paths.codex_dir().join("state_5.sqlite-wal"));
+        // Make ~/.codex read-only so plain SQLITE_OPEN_READ_ONLY cannot create -shm
+        std::fs::set_permissions(paths.codex_dir(), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+
+        let adapter = CodexAdapter::new(paths.clone());
+        let platform = FakePlatform {
+            open_files: HashMap::new(),
+        };
+
+        // Case 1: Codex IS running (`session_for_process`): immutable=1 disallowed ->
+        // skips DB, falls back to rollout file, and sets best_guess = true.
+        let p = ProcInfo {
+            pid: 901,
+            ppid: 1,
+            start_time_us: 100,
+            exe_path: Some(PathBuf::from("/opt/homebrew/bin/codex")),
+            argv: vec!["codex".into()],
+            cwd: Some(PathBuf::from(cwd)),
+        };
+        let resolved = adapter
+            .session_for_process(&p, &platform, &HashSet::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.session_id, rollout_id);
+        assert!(resolved.best_guess);
+
+        // Case 2: NO Codex process running (`tool_running = false`): immutable=1 allowed ->
+        // `session_exists` and `title` read the DB-only row cleanly!
+        let db_sess = Session {
+            key: format!("codex:{db_only_id}"),
+            tool: Tool::Codex,
+            session_id: db_only_id.into(),
+            cwd: cwd.into(),
+            title: None,
+            transcript: None,
+            pid: None,
+            pid_start_us: None,
+            status: SessionStatus::Closed,
+            source: SessionSource::Scan,
+            first_seen: 1,
+            last_seen_live: None,
+            last_boot_id: None,
+            ended_by_user: false,
+            best_guess: false,
+            pinned: false,
+            hidden: false,
+        };
+        assert!(!adapter.session_exists(&db_sess, true));
+        assert!(adapter.session_exists(&db_sess, false));
+        assert_eq!(
+            adapter.title(&db_sess, false).as_deref(),
+            Some("DB Only Title")
+        );
+    }
+
+    #[test]
+    fn two_codex_sessions_via_managed_daemon_resolve_to_exact_distinct_ids_and_skip_env_xml() {
+        struct DaemonPlatform {
+            procs: Vec<ProcInfo>,
+            open_files: HashMap<i32, Vec<PathBuf>>,
+        }
+        impl Platform for DaemonPlatform {
+            fn boot_id(&self) -> Result<String> {
+                Ok("1.0".into())
+            }
+            fn list_processes(&self) -> Result<Vec<ProcInfo>> {
+                Ok(self.procs.clone())
+            }
+            fn process_info(&self, pid: i32) -> Option<ProcInfo> {
+                self.procs.iter().find(|p| p.pid == pid).cloned()
+            }
+            fn process_open_files(&self, pid: i32) -> Vec<PathBuf> {
+                self.open_files.get(&pid).cloned().unwrap_or_default()
+            }
+            fn parent_pid(&self) -> i32 {
+                1
+            }
+        }
+
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+        let sess_dir = paths.codex_sessions_dir().join("2026/11/23");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+
+        let cwd = "/private/tmp/shared-codex";
+        let r1 = sess_dir.join("rollout-2026-11-23T10-00-00-01a2-aaaa.jsonl");
+        let r2 = sess_dir.join("rollout-2026-11-23T10-01-00-01a2-bbbb.jsonl");
+        std::fs::write(
+            &r1,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"01a2-aaaa\",\"cwd\":\"{cwd}\"}}}}\n\
+                 {{\"type\":\"response_item\",\"payload\":{{\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"<environment_context><cwd>{cwd}</cwd></environment_context>\"}}]}}}}\n\
+                 {{\"type\":\"response_item\",\"payload\":{{\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"Remember codeword COBALT-71\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &r2,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"01a2-bbbb\",\"cwd\":\"{cwd}\"}}}}\n\
+                 {{\"type\":\"response_item\",\"payload\":{{\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"<environment_context><cwd>{cwd}</cwd></environment_context>\"}}]}}}}\n\
+                 {{\"type\":\"response_item\",\"payload\":{{\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"Remember codeword AMBER-82\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut open_files = HashMap::new();
+        open_files.insert(9000, vec![r1, r2]);
+
+        let platform = DaemonPlatform {
+            procs: vec![
+                ProcInfo {
+                    pid: 9000,
+                    ppid: 1,
+                    start_time_us: 10,
+                    exe_path: Some(PathBuf::from(
+                        "/Users/u/.codex/packages/app-server-daemon/bin/codex",
+                    )),
+                    argv: vec![
+                        "codex".into(),
+                        "app-server".into(),
+                        "--listen".into(),
+                        "unix://".into(),
+                        "--managed-daemon".into(),
+                    ],
+                    cwd: Some(PathBuf::from("/")),
+                },
+                ProcInfo {
+                    pid: 9001,
+                    ppid: 1,
+                    start_time_us: 100,
+                    exe_path: Some(PathBuf::from("/opt/homebrew/bin/codex")),
+                    argv: vec!["codex".into()],
+                    cwd: Some(PathBuf::from(cwd)),
+                },
+                ProcInfo {
+                    pid: 9002,
+                    ppid: 1,
+                    start_time_us: 200,
+                    exe_path: Some(PathBuf::from("/opt/homebrew/bin/codex")),
+                    argv: vec!["codex".into()],
+                    cwd: Some(PathBuf::from(cwd)),
+                },
+            ],
+            open_files,
+        };
+
+        let report = crate::scanner::run_scan(&paths, &platform).unwrap();
+        assert_eq!(report.live_found, 2);
+
+        let reg = crate::registry::Registry::open(&paths.registry_db).unwrap();
+        let s1 = reg.get_by_key("codex:01a2-aaaa").unwrap().unwrap();
+        let s2 = reg.get_by_key("codex:01a2-bbbb").unwrap().unwrap();
+        assert!(!s1.best_guess);
+        assert!(!s2.best_guess);
+        assert_eq!(s1.title.as_deref(), Some("Remember codeword COBALT-71"));
+        assert_eq!(s2.title.as_deref(), Some("Remember codeword AMBER-82"));
     }
 }

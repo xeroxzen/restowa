@@ -1,7 +1,7 @@
-use crate::adapters::{adapters_for_paths, Adapter};
+use crate::adapters::{adapters_for_paths, owning_tool_of_process, Adapter};
 use crate::error::Result;
 use crate::hooks::replay_spool;
-use crate::model::{Session, SessionRef, SessionSource, SessionStatus};
+use crate::model::{ProcInfo, Session, SessionRef, SessionSource, SessionStatus, Tool};
 use crate::paths::AppPaths;
 use crate::platform::Platform;
 use crate::registry::{Registry, ScanSessionUpsert};
@@ -29,6 +29,7 @@ pub struct ScanReport {
 pub struct LiveDiscoverySnapshot {
     pub processes_inspected: usize,
     pub proc_starts: HashMap<i32, i64>,
+    pub running_tools: HashSet<Tool>,
     pub discovered: Vec<DiscoveredLiveSession>,
 }
 
@@ -41,34 +42,57 @@ pub fn discover_live_sessions(
 ) -> Result<LiveDiscoverySnapshot> {
     let adapters = adapters_for_paths(paths);
     let mut proc_starts = HashMap::new();
-    let mut discovered = Vec::new();
+    let mut running_tools = HashSet::new();
+    let mut matched_procs: Vec<(usize, ProcInfo)> = Vec::new();
 
     let processes_inspected = platform.for_each_process(&mut |proc_info| {
         proc_starts.insert(proc_info.pid, proc_info.start_time_us);
-        for adapter in &adapters {
+        if let Some(tool) = owning_tool_of_process(proc_info) {
+            running_tools.insert(tool);
+        }
+        for (idx, adapter) in adapters.iter().enumerate() {
             if adapter.matches_process(proc_info) {
-                match adapter.session_for_process(proc_info, platform) {
-                    Ok(Some(session_ref)) => {
-                        discovered.push(DiscoveredLiveSession {
-                            session_ref,
-                            pid: proc_info.pid,
-                            pid_start_us: proc_info.start_time_us,
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        log::warn!(
-                            "adapter {} failed resolving pid {}: {}",
-                            adapter.tool(),
-                            proc_info.pid,
-                            err
-                        );
-                    }
-                }
+                running_tools.insert(adapter.tool());
+                matched_procs.push((idx, proc_info.clone()));
                 break;
             }
         }
     })?;
+
+    // Resolve newest processes first so fallback matching pairs the newest
+    // process with the newest unclaimed session in a shared folder.
+    matched_procs.sort_by(|a, b| {
+        b.1.start_time_us
+            .cmp(&a.1.start_time_us)
+            .then_with(|| b.1.pid.cmp(&a.1.pid))
+    });
+
+    let mut claimed_by_tool: HashMap<Tool, HashSet<String>> = HashMap::new();
+    let mut discovered = Vec::with_capacity(matched_procs.len());
+    for (idx, proc_info) in &matched_procs {
+        let adapter = &adapters[*idx];
+        let tool = adapter.tool();
+        let claimed = claimed_by_tool.entry(tool).or_default();
+        match adapter.session_for_process(proc_info, platform, claimed) {
+            Ok(Some(session_ref)) => {
+                claimed.insert(session_ref.session_id.clone());
+                discovered.push(DiscoveredLiveSession {
+                    session_ref,
+                    pid: proc_info.pid,
+                    pid_start_us: proc_info.start_time_us,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                log::warn!(
+                    "adapter {} failed resolving pid {}: {}",
+                    tool,
+                    proc_info.pid,
+                    err
+                );
+            }
+        }
+    }
 
     // If two live processes mapped to the same (tool, session_id) via fallback,
     // flag them as best_guess so ambiguity is never hidden silently.
@@ -87,6 +111,7 @@ pub fn discover_live_sessions(
     Ok(LiveDiscoverySnapshot {
         processes_inspected,
         proc_starts,
+        running_tools,
         discovered,
     })
 }
@@ -104,6 +129,7 @@ pub fn run_scan(paths: &AppPaths, platform: &dyn Platform) -> Result<ScanReport>
 
     let snapshot = discover_live_sessions(paths, platform)?;
     let proc_starts = snapshot.proc_starts;
+    let running_tools = snapshot.running_tools;
     let discovered = snapshot.discovered;
     let processes_inspected = snapshot.processes_inspected;
 
@@ -168,7 +194,7 @@ pub fn run_scan(paths: &AppPaths, platform: &dyn Platform) -> Result<ScanReport>
 
         if !is_currently_live && session.status != SessionStatus::Missing {
             if let Some(adapter) = find_adapter(&adapters, session.tool) {
-                if !adapter.session_exists(session) {
+                if !adapter.session_exists(session, running_tools.contains(&session.tool)) {
                     registry.mark_missing(&session.key)?;
                     marked_missing += 1;
                 }
@@ -210,6 +236,7 @@ pub fn load_merged_sessions(
 
     let snapshot = discover_live_sessions(paths, platform)?;
     let proc_starts = snapshot.proc_starts;
+    let running_tools = snapshot.running_tools;
     let discovered = snapshot.discovered;
 
     let adapters = adapters_for_paths(paths);
@@ -232,7 +259,7 @@ pub fn load_merged_sessions(
         }
         if s.title.is_none() {
             if let Some(adapter) = find_adapter(&adapters, s.tool) {
-                s.title = adapter.title(&s);
+                s.title = adapter.title(&s, running_tools.contains(&s.tool));
             }
         }
         by_key.insert(s.key.clone(), s);

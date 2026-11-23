@@ -6,6 +6,7 @@ use crate::paths::AppPaths;
 use crate::platform::Platform;
 use crate::shell::expand_resume_template;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -291,6 +292,7 @@ impl Adapter for ClaudeAdapter {
         &self,
         p: &ProcInfo,
         _platform: &dyn Platform,
+        _claimed_ids: &HashSet<String>,
     ) -> Result<Option<SessionRef>> {
         if let Some(pid_file) = self.read_pid_session(p.pid) {
             let transcript = self.expected_transcript_path(&pid_file.cwd, &pid_file.session_id);
@@ -326,7 +328,7 @@ impl Adapter for ClaudeAdapter {
         Ok(None)
     }
 
-    fn session_exists(&self, s: &Session) -> bool {
+    fn session_exists(&self, s: &Session, _tool_running: bool) -> bool {
         if let Some(transcript) = &s.transcript {
             if Path::new(transcript).is_file() {
                 return true;
@@ -346,7 +348,7 @@ impl Adapter for ClaudeAdapter {
         false
     }
 
-    fn title(&self, s: &Session) -> Option<String> {
+    fn title(&self, s: &Session, _tool_running: bool) -> Option<String> {
         if let Some(transcript) = &s.transcript {
             if let Some(t) = Self::extract_title_from_transcript(Path::new(transcript)) {
                 return Some(t);
@@ -534,7 +536,7 @@ mod tests {
         };
 
         let resolved = adapter
-            .session_for_process(&proc_info, &EmptyPlatform)
+            .session_for_process(&proc_info, &EmptyPlatform, &HashSet::new())
             .unwrap()
             .unwrap();
         assert_eq!(resolved.session_id, sid);
@@ -567,7 +569,7 @@ mod tests {
         };
 
         let resolved = adapter
-            .session_for_process(&proc_info, &EmptyPlatform)
+            .session_for_process(&proc_info, &EmptyPlatform, &HashSet::new())
             .unwrap()
             .unwrap();
         assert_eq!(resolved.session_id, "d9819a06-0000-4000-8000-000000000006");

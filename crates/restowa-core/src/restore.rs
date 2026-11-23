@@ -115,6 +115,7 @@ pub fn run_restore(
             session_id: session.session_id.clone(),
             cwd: session.cwd.clone(),
             title: session.title.clone(),
+            best_guess: session.best_guess,
             resume_command,
             shell_command,
         };

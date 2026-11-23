@@ -4,6 +4,7 @@ use restowa_core::model::ProcInfo;
 use restowa_core::paths::AppPaths;
 use restowa_core::platform::current_platform;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -81,7 +82,7 @@ fn claude_adapter_reads_fixture_pid_file_and_transcript() {
     assert!(adapter.matches_process(&proc_info));
     let platform = current_platform();
     let resolved = adapter
-        .session_for_process(&proc_info, &platform)
+        .session_for_process(&proc_info, &platform, &HashSet::new())
         .unwrap()
         .unwrap();
     assert_eq!(resolved.session_id, "5e45591c-0000-4000-8000-000000000001");

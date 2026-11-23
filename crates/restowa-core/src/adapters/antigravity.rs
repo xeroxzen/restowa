@@ -1,5 +1,7 @@
 use crate::adapters::claude::normalize_title;
-use crate::adapters::sqlite_ro::{file_uri_to_path, open_external_readonly, verify_table_columns};
+use crate::adapters::sqlite_ro::{
+    file_uri_to_path, open_external_readonly, verify_table_columns, ExternalDbOpen,
+};
 use crate::adapters::Adapter;
 use crate::config::ToolConfig;
 use crate::doctor::{CheckStatus, DoctorCheck};
@@ -8,7 +10,7 @@ use crate::model::{ProcInfo, Session, SessionRef, Tool};
 use crate::paths::AppPaths;
 use crate::platform::Platform;
 use crate::shell::expand_resume_template;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const NON_INTERACTIVE_ARGS: &[&str] = &[
@@ -44,6 +46,12 @@ struct SummaryRow {
     workspace_uris: String,
 }
 
+enum SummariesQueryResult {
+    Rows(Vec<SummaryRow>),
+    Skipped,
+    NotFound,
+}
+
 impl AntigravityAdapter {
     pub fn new(paths: AppPaths) -> Self {
         Self { paths }
@@ -77,7 +85,6 @@ impl AntigravityAdapter {
     /// - `~/.gemini/antigravity-cli/presence/<id>.lock`
     /// - `~/.gemini/antigravity-cli/conversations/<id>.db`
     fn extract_id_from_open_files(open_files: &[PathBuf]) -> Option<String> {
-        // Prefer presence/<id>.lock first (always held by active interactive CLI)
         for path in open_files {
             let s = path.to_string_lossy();
             if s.contains("antigravity-cli/presence/") {
@@ -114,8 +121,12 @@ impl AntigravityAdapter {
         serde_json::from_str(&raw).ok()
     }
 
-    fn query_summary_by_id(&self, id: &str) -> Option<SummaryRow> {
-        let conn = open_external_readonly(&self.paths.antigravity_summaries_db())?;
+    fn query_summary_by_id(&self, id: &str, allow_immutable: bool) -> Option<SummaryRow> {
+        let ExternalDbOpen::Opened(conn) =
+            open_external_readonly(&self.paths.antigravity_summaries_db(), allow_immutable)
+        else {
+            return None;
+        };
         if verify_table_columns(
             &conn,
             "conversation_summaries",
@@ -143,8 +154,13 @@ impl AntigravityAdapter {
         .ok()
     }
 
-    fn query_summaries_for_cwd(&self, cwd: &str) -> Option<Vec<SummaryRow>> {
-        let conn = open_external_readonly(&self.paths.antigravity_summaries_db())?;
+    fn query_summaries_for_cwd(&self, cwd: &str, allow_immutable: bool) -> SummariesQueryResult {
+        let conn =
+            match open_external_readonly(&self.paths.antigravity_summaries_db(), allow_immutable) {
+                ExternalDbOpen::Opened(c) => c,
+                ExternalDbOpen::NotFound => return SummariesQueryResult::NotFound,
+                ExternalDbOpen::Skipped => return SummariesQueryResult::Skipped,
+            };
         if verify_table_columns(
             &conn,
             "conversation_summaries",
@@ -158,38 +174,38 @@ impl AntigravityAdapter {
         )
         .is_err()
         {
-            return None;
+            return SummariesQueryResult::Skipped;
         }
-        let mut stmt = conn
-            .prepare(
-                "SELECT conversation_id, title, preview, workspace_uris
-                 FROM conversation_summaries
-                 WHERE parent_conversation_id = ''
-                 ORDER BY last_modified_time DESC
-                 LIMIT 200",
-            )
-            .ok()?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(SummaryRow {
-                    conversation_id: r.get(0)?,
-                    title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    preview: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    workspace_uris: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                })
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT conversation_id, title, preview, workspace_uris
+             FROM conversation_summaries
+             WHERE parent_conversation_id = ''
+             ORDER BY last_modified_time DESC
+             LIMIT 200",
+        ) else {
+            return SummariesQueryResult::Skipped;
+        };
+        let Ok(rows) = stmt.query_map([], |r| {
+            Ok(SummaryRow {
+                conversation_id: r.get(0)?,
+                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                preview: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                workspace_uris: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
             })
-            .ok()?;
+        }) else {
+            return SummariesQueryResult::Skipped;
+        };
 
         let mut matched = Vec::new();
         for row in rows.flatten() {
             if workspace_uris_contains(&row.workspace_uris, cwd) {
                 matched.push(row);
-                if matched.len() >= 2 {
+                if matched.len() >= 16 {
                     break;
                 }
             }
         }
-        Some(matched)
+        SummariesQueryResult::Rows(matched)
     }
 
     fn title_from_summary(row: &SummaryRow) -> Option<String> {
@@ -261,13 +277,16 @@ impl Adapter for AntigravityAdapter {
         &self,
         p: &ProcInfo,
         platform: &dyn Platform,
+        claimed_ids: &HashSet<String>,
     ) -> Result<Option<SessionRef>> {
         let proc_cwd = p.cwd.as_ref().map(|c| c.to_string_lossy().into_owned());
+        // An Antigravity process is running right now -> never allow `immutable=1`.
+        let allow_immutable = false;
 
         // 1. Exact: open FD on `presence/<id>.lock` or `conversations/<id>.db`.
         let open_files = platform.process_open_files(p.pid);
         if let Some(id) = Self::extract_id_from_open_files(&open_files) {
-            let summary = self.query_summary_by_id(&id);
+            let summary = self.query_summary_by_id(&id, allow_immutable);
             let cwd = proc_cwd
                 .clone()
                 .or_else(|| summary.as_ref().and_then(Self::first_workspace_path))
@@ -288,7 +307,7 @@ impl Adapter for AntigravityAdapter {
 
         // 2. Exact: `--conversation <id>` in argv.
         if let Some(id) = Self::extract_conversation_arg(&p.argv) {
-            let summary = self.query_summary_by_id(&id);
+            let summary = self.query_summary_by_id(&id, allow_immutable);
             let cwd = proc_cwd
                 .clone()
                 .or_else(|| summary.as_ref().and_then(Self::first_workspace_path))
@@ -311,14 +330,39 @@ impl Adapter for AntigravityAdapter {
             return Ok(None);
         };
 
-        // 3. Fallback 1: `cache/last_conversations.json[cwd]`.
+        // 3. Fallback 1: `conversation_summaries.db` (`allow_immutable = false`).
+        let mut db_skipped = false;
+        match self.query_summaries_for_cwd(&cwd, allow_immutable) {
+            SummariesQueryResult::Rows(rows) => {
+                if let Some(chosen) = rows
+                    .iter()
+                    .find(|r| !claimed_ids.contains(&r.conversation_id))
+                    .or_else(|| rows.first())
+                {
+                    let ambiguous = rows.len() > 1;
+                    let title_hint = Self::title_from_summary(chosen);
+                    let transcript = self.conversation_db_path(&chosen.conversation_id);
+                    return Ok(Some(SessionRef {
+                        tool: Tool::Antigravity,
+                        session_id: chosen.conversation_id.clone(),
+                        cwd,
+                        transcript: Some(transcript.to_string_lossy().into_owned()),
+                        title_hint,
+                        best_guess: ambiguous,
+                    }));
+                }
+            }
+            SummariesQueryResult::Skipped => {
+                db_skipped = true;
+            }
+            SummariesQueryResult::NotFound => {}
+        }
+
+        // 4. Fallback 2: `cache/last_conversations.json[cwd]`.
         if let Some(map) = self.read_last_conversations_map() {
             if let Some(id) = map.get(&cwd) {
-                let ambiguous = self
-                    .query_summaries_for_cwd(&cwd)
-                    .is_some_and(|rows| rows.len() > 1);
                 let title_hint = self
-                    .query_summary_by_id(id)
+                    .query_summary_by_id(id, allow_immutable)
                     .as_ref()
                     .and_then(Self::title_from_summary);
                 let transcript = self.conversation_db_path(id);
@@ -328,24 +372,7 @@ impl Adapter for AntigravityAdapter {
                     cwd,
                     transcript: Some(transcript.to_string_lossy().into_owned()),
                     title_hint,
-                    best_guess: ambiguous,
-                }));
-            }
-        }
-
-        // 4. Fallback 2: `conversation_summaries.db` matching `cwd`.
-        if let Some(rows) = self.query_summaries_for_cwd(&cwd) {
-            if let Some(first) = rows.first() {
-                let ambiguous = rows.len() > 1;
-                let title_hint = Self::title_from_summary(first);
-                let transcript = self.conversation_db_path(&first.conversation_id);
-                return Ok(Some(SessionRef {
-                    tool: Tool::Antigravity,
-                    session_id: first.conversation_id.clone(),
-                    cwd,
-                    transcript: Some(transcript.to_string_lossy().into_owned()),
-                    title_hint,
-                    best_guess: ambiguous,
+                    best_guess: db_skipped || claimed_ids.contains(id),
                 }));
             }
         }
@@ -353,12 +380,12 @@ impl Adapter for AntigravityAdapter {
         Ok(None)
     }
 
-    fn session_exists(&self, s: &Session) -> bool {
+    fn session_exists(&self, s: &Session, _tool_running: bool) -> bool {
         self.conversation_db_path(&s.session_id).is_file()
     }
 
-    fn title(&self, s: &Session) -> Option<String> {
-        let row = self.query_summary_by_id(&s.session_id)?;
+    fn title(&self, s: &Session, tool_running: bool) -> Option<String> {
+        let row = self.query_summary_by_id(&s.session_id, !tool_running)?;
         Self::title_from_summary(&row)
     }
 
@@ -366,13 +393,13 @@ impl Adapter for AntigravityAdapter {
         expand_resume_template(&cfg.resume, &s.session_id)
     }
 
-    fn doctor_checks(&self) -> Vec<DoctorCheck> {
+    fn doctor_checks(&self, tool_running: bool) -> Vec<DoctorCheck> {
         let db_path = self.paths.antigravity_summaries_db();
         if !db_path.is_file() {
             return Vec::new();
         }
-        let check = match open_external_readonly(&db_path) {
-            Some(conn) => match verify_table_columns(
+        let check = match open_external_readonly(&db_path, !tool_running) {
+            ExternalDbOpen::Opened(conn) => match verify_table_columns(
                 &conn,
                 "conversation_summaries",
                 &["conversation_id", "title", "preview", "workspace_uris"],
@@ -391,10 +418,13 @@ impl Adapter for AntigravityAdapter {
                     ),
                 },
             },
-            None => DoctorCheck {
+            ExternalDbOpen::Skipped | ExternalDbOpen::NotFound => DoctorCheck {
                 name: "schema:antigravity".to_string(),
                 status: CheckStatus::Warn,
-                detail: format!("could not open {} read-only", db_path.display()),
+                detail: format!(
+                    "skipped {} read-only check (immutable=1 disallowed while agy is running)",
+                    db_path.display()
+                ),
             },
         };
         vec![check]
@@ -555,14 +585,18 @@ mod tests {
             cwd: Some(PathBuf::from("/Users/dev/cloud")),
         };
 
-        let resolved = adapter.session_for_process(&p, &platform).unwrap().unwrap();
+        let resolved = adapter
+            .session_for_process(&p, &platform, &HashSet::new())
+            .unwrap()
+            .unwrap();
         assert_eq!(resolved.session_id, id);
         assert_eq!(resolved.title_hint.as_deref(), Some("AWS Profiles Audit"));
         assert!(!resolved.best_guess);
     }
 
     #[test]
-    fn missing_summaries_table_falls_back_to_last_conversations_cache_and_doctor_warns() {
+    fn missing_summaries_table_falls_back_to_last_conversations_cache_with_best_guess_and_doctor_warns(
+    ) {
         let home = TestHome::new();
         let paths = AppPaths::from_home(home.0.clone());
         std::fs::create_dir_all(paths.antigravity_last_conversations().parent().unwrap()).unwrap();
@@ -592,10 +626,14 @@ mod tests {
             cwd: Some(PathBuf::from("/Users/dev/proj")),
         };
 
-        let resolved = adapter.session_for_process(&p, &platform).unwrap().unwrap();
+        let resolved = adapter
+            .session_for_process(&p, &platform, &HashSet::new())
+            .unwrap()
+            .unwrap();
         assert_eq!(resolved.session_id, "9226b940-0000-4000-8000-000000000004");
+        assert!(resolved.best_guess);
 
-        let checks = adapter.doctor_checks();
+        let checks = adapter.doctor_checks(false);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, CheckStatus::Warn);
         assert!(checks[0]

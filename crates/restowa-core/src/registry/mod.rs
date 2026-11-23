@@ -443,6 +443,27 @@ impl Registry {
         Ok(sessions)
     }
 
+    /// All non-hidden, non-missing pinned sessions.
+    pub fn list_pinned(&self) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, tool, session_id, cwd, title, transcript,
+                    pid, pid_start_us, status, source,
+                    first_seen, last_seen_live, last_boot_id,
+                    ended_by_user, best_guess, pinned, hidden
+             FROM sessions
+             WHERE hidden = 0
+               AND pinned = 1
+               AND status IN ('live', 'closed')
+             ORDER BY COALESCE(last_seen_live, first_seen) DESC, key ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_session)?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row?);
+        }
+        Ok(sessions)
+    }
+
     pub fn get_by_key(&self, key: &str) -> Result<Option<Session>> {
         self.conn
             .query_row(

@@ -182,7 +182,7 @@ Every command supports `--json` for the menu bar app and scripts. Exit codes: 0 
 
 | Command | What it does |
 | --- | --- |
-| `restowa list [--live \| --last-boot \| --all] [--tool T] [--json]` | Table of sessions: short ID, tool, project (cwd basename), title, status, last seen. Default `--live` |
+| `restowa list [--live \| --last-boot \| --pinned \| --all] [--tool T] [--json]` | Table of sessions: short ID, tool, project (cwd basename), title, status, last seen. Default `--live` |
 | `restowa restore [KEY...] [--last-boot] [--terminal ghostty\|terminal\|iterm] [--dry-run]` | Opens one tab per session. `--dry-run` prints the commands only |
 | `restowa scan` | One scan pass (what launchd runs). Silent unless `-v` |
 | `restowa hook claude <session-start\|session-end>` | Reads hook JSON from stdin, upserts the session. Must finish in < 50 ms and always exit 0 so it never blocks Claude Code |
@@ -282,31 +282,33 @@ pub trait TerminalBackend {
 
 ## Menu bar app
 
-A thin SwiftUI `MenuBarExtra` that reads the registry and calls the CLI; it contains no capture or restore logic of its own.
+A thin SwiftUI `MenuBarExtra` built with SwiftPM plus a `.app` bundle build script under `apps/macos/Restowa/`. It contains no capture, restore, or SQLite logic of its own: it never opens `registry.db` directly and routes every read and write through the `restowa` CLI.
 
 **Layout (window-style menu, \~360 pt wide)**
 
-1. Header: “Restore 7 sessions from last boot” button, shown only when the last-boot set has sessions that are not live.
-2. Section **Open now**: sessions grouped by project, each row showing a tool icon, title, relative time.
+1. Header: “Restore N sessions from last boot” button, shown only when the last-boot set has sessions that are not live.
+2. Section **Open now**: sessions grouped by project, each row showing a tool icon, title, `(best guess)` indicator when applicable, and relative time.
 3. Section **Last boot**: same layout, each row with a Restore button.
 4. Section **Pinned**.
 5. Footer: search field, Settings, Quit.
 
 **Row actions (context menu):** Restore, Copy resume command, Reveal folder in Finder, Pin/Unpin, Rename, Forget.
 
-**Settings:** default terminal backend, scan interval (1/2/5 min), launch at login (`SMAppService`), show tools (checkboxes), “Run doctor”.
+**Settings:** default terminal backend, scan interval (1/2/5 min), launch at login (`SMAppService.mainApp`, falling back to a per-user LaunchAgent when running a locally/ad-hoc signed build), show tools (checkboxes), `restowa` binary path override, “Run doctor”.
 
 **Implementation rules**
 
-- Read SQLite read-only with the system `SQLite3` library or GRDB. Writes go through `restowa … --json` via `Process`.
-- Refresh only while the menu is open (watch the DB file with `DispatchSource`); no polling when closed.
+- Never read SQLite in Swift. When the menu opens, fetch sessions via `restowa list --live --json`, `restowa list --last-boot --json`, and `restowa list --pinned --json` through `Process`. Every write (`restore`, `pin`, `unpin`, `rename`, `forget`, `doctor`) goes through the CLI.
+- Refresh only while the menu is open: watch the registry file's modification time (`~/Library/Application Support/restowa/registry.db` and `-wal` via `DispatchSource`) strictly while open to trigger a CLI refresh; stop watching immediately when closed (zero polling or work while closed).
+- Zero third-party Swift packages (Foundation, SwiftUI, AppKit, ServiceManagement only).
+- Set `LSUIElement = true` in `Info.plist` (menu-bar-only agent app, no Dock icon).
 - No web views, no background networking, no analytics.
-- Locate the binary from Settings, else `/opt/homebrew/bin/restowa`, else `/usr/local/bin/restowa`.
+- Locate the binary from Settings, else `/opt/homebrew/bin/restowa`, else `~/.cargo/bin/restowa`, else `/usr/local/bin/restowa`.
 - Budget: ≤ 40 MB RSS idle, menu opens in < 150 ms with 50 sessions.
 
 ## Repo layout
 
-A Cargo workspace for the core and CLI, with the macOS app as a sibling Xcode project.
+A Cargo workspace for the core and CLI, with the macOS app as a sibling SwiftPM package + `.app` bundle script.
 
 ```
 restowa/
@@ -318,12 +320,12 @@ restowa/
 │   │   ├── src/terminal/       # ghostty.rs, terminal_app.rs, iterm.rs
 │   │   └── src/platform/macos/ # libproc, boot ID
 │   └── restowa-cli/            # main.rs, clap commands only
-├── apps/macos/Restowa/         # SwiftUI menu bar app (Xcode)
+├── apps/macos/Restowa/         # SwiftUI menu bar app (SwiftPM + build-app.sh)
 ├── packaging/
 │   ├── dev.restowa.scan.plist
 │   └── homebrew/restowa.rb
 ├── tests/fixtures/             # sample session files per tool, hook JSON
-└── docs/                       # this spec, ADRs, Phase 0 findings
+└── docs/                       # this spec, ADRs, Phase 0-4 findings
 ```
 
 Keep all macOS-specific code under `platform/macos` and `terminal/` behind traits, so Linux later means new modules rather than rewrites.

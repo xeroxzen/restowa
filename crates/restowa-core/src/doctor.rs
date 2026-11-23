@@ -1,7 +1,8 @@
 use crate::adapters::claude::ClaudeAdapter;
-use crate::adapters::{adapters_for_paths, Adapter};
+use crate::adapters::{adapters_for_paths, owning_tool_of_process, Adapter};
 use crate::hooks::inspect_claude_hooks;
 use crate::launchd::inspect_launchd_agent;
+use crate::model::Tool;
 use crate::paths::AppPaths;
 use crate::platform::Platform;
 use crate::registry::Registry;
@@ -9,6 +10,7 @@ use crate::terminal::ghostty::GhosttyBackend;
 use crate::terminal::terminal_app::TerminalAppBackend;
 use crate::terminal::TerminalBackend;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -93,15 +95,21 @@ pub fn run_doctor(paths: &AppPaths, platform: &dyn Platform) -> DoctorReport {
     }
 
     // 3. Claude Code PID session files (~/.claude/sessions/<pid>.json)
+    //    Also track which tools currently have any process running so external
+    //    DB checks strictly honor the `immutable=1` guard.
     let claude_sessions_dir = paths.claude_sessions_dir();
     let claude_adapter = ClaudeAdapter::new(paths.clone());
-    let live_claude_pids: Vec<i32> = platform
-        .list_processes()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| claude_adapter.matches_process(p))
-        .map(|p| p.pid)
-        .collect();
+    let mut live_claude_pids: Vec<i32> = Vec::new();
+    let mut running_tools: HashSet<Tool> = HashSet::new();
+    let _ = platform.for_each_process(&mut |p| {
+        if let Some(tool) = owning_tool_of_process(p) {
+            running_tools.insert(tool);
+        }
+        if claude_adapter.matches_process(p) {
+            running_tools.insert(Tool::Claude);
+            live_claude_pids.push(p.pid);
+        }
+    });
 
     if !claude_sessions_dir.is_dir() {
         checks.push(DoctorCheck {
@@ -272,7 +280,8 @@ pub fn run_doctor(paths: &AppPaths, platform: &dyn Platform) -> DoctorReport {
 
     // 7. Adapter-specific external database schema checks (read-only)
     for adapter in adapters_for_paths(paths) {
-        checks.extend(adapter.doctor_checks());
+        let tool_running = running_tools.contains(&adapter.tool());
+        checks.extend(adapter.doctor_checks(tool_running));
     }
 
     let has_errors = checks.iter().any(|c| c.status == CheckStatus::Error);

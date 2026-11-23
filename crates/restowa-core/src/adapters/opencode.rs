@@ -1,5 +1,5 @@
 use crate::adapters::claude::normalize_title;
-use crate::adapters::sqlite_ro::{open_external_readonly, verify_table_columns};
+use crate::adapters::sqlite_ro::{open_external_readonly, verify_table_columns, ExternalDbOpen};
 use crate::adapters::Adapter;
 use crate::config::ToolConfig;
 use crate::doctor::{CheckStatus, DoctorCheck};
@@ -8,6 +8,7 @@ use crate::model::{ProcInfo, Session, SessionRef, Tool};
 use crate::paths::AppPaths;
 use crate::platform::Platform;
 use crate::shell::expand_resume_template;
+use std::collections::HashSet;
 use std::path::Path;
 
 const NON_TUI_SUBCOMMANDS: &[&str] = &[
@@ -71,8 +72,16 @@ impl OpenCodeAdapter {
         None
     }
 
-    fn query_sessions_for_dir(&self, dir: &str) -> Option<Vec<OpenCodeSessionRow>> {
-        let conn = open_external_readonly(&self.paths.opencode_db())?;
+    fn query_sessions_for_dir(
+        &self,
+        dir: &str,
+        allow_immutable: bool,
+    ) -> Option<Vec<OpenCodeSessionRow>> {
+        let ExternalDbOpen::Opened(conn) =
+            open_external_readonly(&self.paths.opencode_db(), allow_immutable)
+        else {
+            return None;
+        };
         if verify_table_columns(
             &conn,
             "session",
@@ -90,7 +99,7 @@ impl OpenCodeAdapter {
                    AND parent_id IS NULL
                    AND time_archived IS NULL
                  ORDER BY time_updated DESC, id DESC
-                 LIMIT 2",
+                 LIMIT 16",
             )
             .ok()?;
         let rows = stmt
@@ -109,8 +118,16 @@ impl OpenCodeAdapter {
         Some(out)
     }
 
-    fn query_session_by_id(&self, session_id: &str) -> Option<OpenCodeSessionRow> {
-        let conn = open_external_readonly(&self.paths.opencode_db())?;
+    fn query_session_by_id(
+        &self,
+        session_id: &str,
+        allow_immutable: bool,
+    ) -> Option<OpenCodeSessionRow> {
+        let ExternalDbOpen::Opened(conn) =
+            open_external_readonly(&self.paths.opencode_db(), allow_immutable)
+        else {
+            return None;
+        };
         if verify_table_columns(&conn, "session", &["id", "directory", "title"]).is_err() {
             return None;
         }
@@ -131,22 +148,25 @@ impl OpenCodeAdapter {
         .ok()
     }
 
-    fn resolve_title(&self, row: &OpenCodeSessionRow) -> Option<String> {
+    fn resolve_title(&self, row: &OpenCodeSessionRow, allow_immutable: bool) -> Option<String> {
         let trimmed = row.title.trim();
         if !trimmed.is_empty() && !trimmed.starts_with("New session - ") {
             return Some(normalize_title(trimmed));
         }
-        self.first_user_part_text(&row.id)
+        self.first_user_part_text(&row.id, allow_immutable)
     }
 
-    fn first_user_part_text(&self, session_id: &str) -> Option<String> {
-        let conn = open_external_readonly(&self.paths.opencode_db())?;
+    fn first_user_part_text(&self, session_id: &str, allow_immutable: bool) -> Option<String> {
+        let ExternalDbOpen::Opened(conn) =
+            open_external_readonly(&self.paths.opencode_db(), allow_immutable)
+        else {
+            return None;
+        };
         if verify_table_columns(&conn, "message", &["id", "session_id", "data"]).is_err()
             || verify_table_columns(&conn, "part", &["message_id", "session_id", "data"]).is_err()
         {
             return None;
         }
-        // Find the earliest user message for this session
         let mut msg_stmt = conn
             .prepare(
                 "SELECT id, data FROM message
@@ -232,20 +252,23 @@ impl Adapter for OpenCodeAdapter {
         &self,
         p: &ProcInfo,
         _platform: &dyn Platform,
+        claimed_ids: &HashSet<String>,
     ) -> Result<Option<SessionRef>> {
         let proc_cwd = p.cwd.as_ref().map(|c| c.to_string_lossy().into_owned());
         let db_path_str = Some(self.paths.opencode_db().to_string_lossy().into_owned());
+        // An OpenCode process is running right now -> never allow `immutable=1`.
+        let allow_immutable = false;
 
         // 1. Exact: `--session <id>` or `-s <id>` in argv.
         if let Some(session_id) = Self::extract_session_arg(&p.argv) {
-            if let Some(row) = self.query_session_by_id(&session_id) {
+            if let Some(row) = self.query_session_by_id(&session_id, allow_immutable) {
                 let cwd = if !row.directory.is_empty() {
                     row.directory.clone()
                 } else {
                     proc_cwd.clone().unwrap_or_default()
                 };
                 if !cwd.is_empty() {
-                    let title_hint = self.resolve_title(&row);
+                    let title_hint = self.resolve_title(&row, allow_immutable);
                     return Ok(Some(SessionRef {
                         tool: Tool::Opencode,
                         session_id,
@@ -268,18 +291,22 @@ impl Adapter for OpenCodeAdapter {
             return Ok(None);
         }
 
-        // 2. Fallback: newest non-archived top-level session in opencode.db matching `cwd`.
+        // 2. Fallback: newest unclaimed non-archived top-level session in opencode.db.
         let Some(cwd) = proc_cwd else {
             return Ok(None);
         };
-        if let Some(rows) = self.query_sessions_for_dir(&cwd) {
-            if let Some(first) = rows.first() {
+        if let Some(rows) = self.query_sessions_for_dir(&cwd, allow_immutable) {
+            if let Some(chosen) = rows
+                .iter()
+                .find(|r| !claimed_ids.contains(&r.id))
+                .or_else(|| rows.first())
+            {
                 let ambiguous = rows.len() > 1;
-                let title_hint = self.resolve_title(first);
+                let title_hint = self.resolve_title(chosen, allow_immutable);
                 return Ok(Some(SessionRef {
                     tool: Tool::Opencode,
-                    session_id: first.id.clone(),
-                    cwd: first.directory.clone(),
+                    session_id: chosen.id.clone(),
+                    cwd: chosen.directory.clone(),
                     transcript: db_path_str,
                     title_hint,
                     best_guess: ambiguous,
@@ -290,26 +317,28 @@ impl Adapter for OpenCodeAdapter {
         Ok(None)
     }
 
-    fn session_exists(&self, s: &Session) -> bool {
-        self.query_session_by_id(&s.session_id).is_some()
+    fn session_exists(&self, s: &Session, tool_running: bool) -> bool {
+        self.query_session_by_id(&s.session_id, !tool_running)
+            .is_some()
     }
 
-    fn title(&self, s: &Session) -> Option<String> {
-        let row = self.query_session_by_id(&s.session_id)?;
-        self.resolve_title(&row)
+    fn title(&self, s: &Session, tool_running: bool) -> Option<String> {
+        let allow_immutable = !tool_running;
+        let row = self.query_session_by_id(&s.session_id, allow_immutable)?;
+        self.resolve_title(&row, allow_immutable)
     }
 
     fn resume_command(&self, s: &Session, cfg: &ToolConfig) -> String {
         expand_resume_template(&cfg.resume, &s.session_id)
     }
 
-    fn doctor_checks(&self) -> Vec<DoctorCheck> {
+    fn doctor_checks(&self, tool_running: bool) -> Vec<DoctorCheck> {
         let db_path = self.paths.opencode_db();
         if !db_path.is_file() {
             return Vec::new();
         }
-        let check = match open_external_readonly(&db_path) {
-            Some(conn) => match verify_table_columns(
+        let check = match open_external_readonly(&db_path, !tool_running) {
+            ExternalDbOpen::Opened(conn) => match verify_table_columns(
                 &conn,
                 "session",
                 &["id", "directory", "title", "time_updated"],
@@ -328,10 +357,13 @@ impl Adapter for OpenCodeAdapter {
                     ),
                 },
             },
-            None => DoctorCheck {
+            ExternalDbOpen::Skipped | ExternalDbOpen::NotFound => DoctorCheck {
                 name: "schema:opencode".to_string(),
                 status: CheckStatus::Warn,
-                detail: format!("could not open {} read-only", db_path.display()),
+                detail: format!(
+                    "skipped {} read-only check (immutable=1 disallowed while opencode is running)",
+                    db_path.display()
+                ),
             },
         };
         vec![check]
@@ -341,6 +373,7 @@ impl Adapter for OpenCodeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::run_scan;
     use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -367,16 +400,18 @@ mod tests {
         }
     }
 
-    struct EmptyPlatform;
-    impl Platform for EmptyPlatform {
+    struct MockPlatform {
+        procs: Vec<ProcInfo>,
+    }
+    impl Platform for MockPlatform {
         fn boot_id(&self) -> Result<String> {
             Ok("1.0".into())
         }
         fn list_processes(&self) -> Result<Vec<ProcInfo>> {
-            Ok(Vec::new())
+            Ok(self.procs.clone())
         }
-        fn process_info(&self, _pid: i32) -> Option<ProcInfo> {
-            None
+        fn process_info(&self, pid: i32) -> Option<ProcInfo> {
+            self.procs.iter().find(|p| p.pid == pid).cloned()
         }
         fn process_open_files(&self, _pid: i32) -> Vec<PathBuf> {
             Vec::new()
@@ -452,13 +487,52 @@ mod tests {
     }
 
     #[test]
+    fn two_opencode_sessions_in_same_folder_both_resolve_and_flag_best_guess() {
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+        seed_opencode_db(&paths.opencode_db());
+
+        let platform = MockPlatform {
+            procs: vec![
+                ProcInfo {
+                    pid: 201,
+                    ppid: 1,
+                    start_time_us: 200,
+                    exe_path: Some(PathBuf::from("/Users/u/.opencode/bin/opencode")),
+                    argv: vec!["opencode".into()],
+                    cwd: Some(PathBuf::from("/Users/dev/multi")),
+                },
+                ProcInfo {
+                    pid: 202,
+                    ppid: 1,
+                    start_time_us: 100,
+                    exe_path: Some(PathBuf::from("/Users/u/.opencode/bin/opencode")),
+                    argv: vec!["opencode".into()],
+                    cwd: Some(PathBuf::from("/Users/dev/multi")),
+                },
+            ],
+        };
+
+        let scan = run_scan(&paths, &platform).unwrap();
+        assert_eq!(scan.live_found, 2);
+
+        let reg = crate::registry::Registry::open(&paths.registry_db).unwrap();
+        let s1 = reg.get_by_key("opencode:ses_multi_1").unwrap().unwrap();
+        let s2 = reg.get_by_key("opencode:ses_multi_2").unwrap().unwrap();
+        assert!(s1.best_guess);
+        assert!(s2.best_guess);
+        assert_ne!(s1.pid, s2.pid);
+    }
+
+    #[test]
     fn resolves_exact_from_argv_and_flags_ambiguous_fallback_as_best_guess() {
         let home = TestHome::new();
         let paths = AppPaths::from_home(home.0.clone());
         seed_opencode_db(&paths.opencode_db());
         let adapter = OpenCodeAdapter::new(paths);
+        let empty_platform = MockPlatform { procs: Vec::new() };
+        let empty_claimed = HashSet::new();
 
-        // Single session in directory -> exact
         let single_proc = ProcInfo {
             pid: 10,
             ppid: 1,
@@ -468,31 +542,13 @@ mod tests {
             cwd: Some(PathBuf::from("/Users/dev/single")),
         };
         let s1 = adapter
-            .session_for_process(&single_proc, &EmptyPlatform)
+            .session_for_process(&single_proc, &empty_platform, &empty_claimed)
             .unwrap()
             .unwrap();
         assert_eq!(s1.session_id, "ses_unique");
         assert_eq!(s1.title_hint.as_deref(), Some("Scaffold adapters"));
         assert!(!s1.best_guess);
 
-        // Two sessions in same directory without --session -> newest + best_guess = true + prompt title fallback
-        let multi_proc = ProcInfo {
-            pid: 11,
-            ppid: 1,
-            start_time_us: 2,
-            exe_path: Some(PathBuf::from("/Users/u/.opencode/bin/opencode")),
-            argv: vec!["opencode".into()],
-            cwd: Some(PathBuf::from("/Users/dev/multi")),
-        };
-        let s2 = adapter
-            .session_for_process(&multi_proc, &EmptyPlatform)
-            .unwrap()
-            .unwrap();
-        assert_eq!(s2.session_id, "ses_multi_1");
-        assert_eq!(s2.title_hint.as_deref(), Some("Inspect auth middleware"));
-        assert!(s2.best_guess);
-
-        // Explicit --session in argv -> exact even in multi-session folder
         let explicit_proc = ProcInfo {
             pid: 12,
             ppid: 1,
@@ -502,7 +558,7 @@ mod tests {
             cwd: Some(PathBuf::from("/Users/dev/multi")),
         };
         let s3 = adapter
-            .session_for_process(&explicit_proc, &EmptyPlatform)
+            .session_for_process(&explicit_proc, &empty_platform, &empty_claimed)
             .unwrap()
             .unwrap();
         assert_eq!(s3.session_id, "ses_multi_2");
@@ -520,8 +576,8 @@ mod tests {
                 .unwrap();
         }
         let adapter = OpenCodeAdapter::new(paths);
+        let empty_platform = MockPlatform { procs: Vec::new() };
 
-        // Falls back cleanly to argv when DB schema is broken
         let proc_with_arg = ProcInfo {
             pid: 20,
             ppid: 1,
@@ -531,12 +587,12 @@ mod tests {
             cwd: Some(PathBuf::from("/Users/dev/app")),
         };
         let s = adapter
-            .session_for_process(&proc_with_arg, &EmptyPlatform)
+            .session_for_process(&proc_with_arg, &empty_platform, &HashSet::new())
             .unwrap()
             .unwrap();
         assert_eq!(s.session_id, "ses_from_argv");
 
-        let checks = adapter.doctor_checks();
+        let checks = adapter.doctor_checks(false);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, CheckStatus::Warn);
         assert!(checks[0].detail.contains("missing table 'session'"));

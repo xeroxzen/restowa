@@ -70,13 +70,16 @@ enum Commands {
 #[derive(Debug, Args)]
 struct ListArgs {
     /// Show only live sessions (default)
-    #[arg(long, conflicts_with_all = ["last_boot", "all"])]
+    #[arg(long, conflicts_with_all = ["last_boot", "pinned", "all"])]
     live: bool,
     /// Show sessions from the previous boot unioned with pinned sessions
-    #[arg(long, conflicts_with_all = ["live", "all"])]
+    #[arg(long, conflicts_with_all = ["live", "pinned", "all"])]
     last_boot: bool,
+    /// Show pinned sessions
+    #[arg(long, conflicts_with_all = ["live", "last_boot", "all"])]
+    pinned: bool,
     /// Show all non-hidden sessions
-    #[arg(long, conflicts_with_all = ["live", "last_boot"])]
+    #[arg(long, conflicts_with_all = ["live", "last_boot", "pinned"])]
     all: bool,
     /// Filter by tool (claude, codex, opencode, antigravity)
     #[arg(long)]
@@ -161,6 +164,15 @@ enum ConfigAction {
     Path,
     /// Open config.toml in $EDITOR
     Edit,
+    /// Update config.toml values (used by the menu bar Settings window and scripts)
+    Set {
+        /// Default terminal backend (ghostty, terminal)
+        #[arg(long)]
+        terminal: Option<String>,
+        /// Background scan interval in seconds (e.g. 60, 120, 300)
+        #[arg(long)]
+        scan_interval: Option<u64>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -258,6 +270,11 @@ fn cmd_list(
                 let prev = reg.previous_boot_id(&current_boot, config.scan_interval_secs)?;
                 reg.list_last_boot(prev.as_deref(), config.scan_interval_secs)?
             }
+            None => Vec::new(),
+        }
+    } else if args.pinned {
+        match Registry::open_read_only(&paths.registry_db)? {
+            Some(reg) => reg.list_pinned()?,
             None => Vec::new(),
         }
     } else {
@@ -381,7 +398,8 @@ fn cmd_restore(
                 report.restored.len()
             );
             for item in &report.restored {
-                println!("  [{}] {}", item.key, item.shell_command);
+                let suffix = if item.best_guess { " (best guess)" } else { "" };
+                println!("  [{}]{suffix} {}", item.key, item.shell_command);
             }
             for s in &report.skipped {
                 println!("  note: {} ({})", s.key, s.reason);
@@ -399,7 +417,8 @@ fn cmd_restore(
             report.failed.len()
         );
         for item in &report.restored {
-            println!("  restored: {} ({})", item.key, item.cwd);
+            let suffix = if item.best_guess { " (best guess)" } else { "" };
+            println!("  restored: {} ({}){suffix}", item.key, item.cwd);
         }
         for s in &report.skipped {
             println!("  skipped:  {} — {}", s.key, s.reason);
@@ -674,6 +693,52 @@ fn cmd_config(paths: &AppPaths, config: &Config, args: &ConfigArgs, json: bool) 
             } else {
                 Ok(EXIT_ERR)
             }
+        }
+        Some(ConfigAction::Set {
+            ref terminal,
+            scan_interval,
+        }) => {
+            let mut updated = config.clone();
+            if let Some(term) = terminal {
+                match term.as_str() {
+                    "ghostty" | "terminal" => updated.terminal = term.clone(),
+                    other => anyhow::bail!(
+                        "unsupported terminal '{other}' (expected 'ghostty' or 'terminal')"
+                    ),
+                }
+            }
+            let interval_changed = if let Some(secs) = scan_interval {
+                if secs < 30 {
+                    anyhow::bail!("scan interval must be at least 30 seconds");
+                }
+                let changed = updated.scan_interval_secs != secs;
+                updated.scan_interval_secs = secs;
+                changed
+            } else {
+                false
+            };
+            // Reinstall the agent before saving so a launchd failure leaves config untouched.
+            if interval_changed {
+                let status = restowa_core::launchd::inspect_launchd_agent(paths, false);
+                if status.plist_exists {
+                    let bin_path = match status.program_path {
+                        Some(p) => std::path::PathBuf::from(p),
+                        None => resolve_launchd_binary_path(None)?,
+                    };
+                    install_launchd_agent(paths, &bin_path, updated.scan_interval_secs, true)
+                        .context(
+                        "failed to reload launchd agent with new scan interval; config not saved",
+                    )?;
+                }
+            }
+            updated.save(&paths.config_file)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&updated)?);
+            } else {
+                println!("{}", updated.to_toml_string()?);
+            }
+            Ok(EXIT_OK)
         }
         None => {
             if json {

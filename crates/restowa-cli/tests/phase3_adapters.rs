@@ -290,5 +290,114 @@ fn phase3_codex_opencode_and_antigravity_fixture_scan_and_resume_commands() {
         pinned: false,
         hidden: false,
     };
-    assert!(!agy_adapter.session_exists(&fake_agy));
+    assert!(!agy_adapter.session_exists(&fake_agy, false));
+}
+
+#[test]
+fn restore_dry_run_displays_best_guess_and_list_pinned_filters_pinned() {
+    let env = IsolatedHome::new("dry-run-best-guess");
+    let paths = AppPaths::from_home(env.home.clone());
+    let proj = env.root.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    let mut reg = Registry::open(&paths.registry_db).unwrap();
+    reg.upsert_scan_live(&restowa_core::registry::ScanSessionUpsert {
+        tool: Tool::Opencode,
+        session_id: "ses_guess_1".into(),
+        cwd: proj.to_string_lossy().into_owned(),
+        transcript: None,
+        title_hint: Some("Ambiguous OpenCode".into()),
+        pid: 99991,
+        pid_start_us: 100,
+        boot_id: "boot-old".into(),
+        best_guess: true,
+        now: 1000,
+    })
+    .unwrap();
+    reg.upsert_scan_live(&restowa_core::registry::ScanSessionUpsert {
+        tool: Tool::Codex,
+        session_id: "019a0000-0000-7000-8000-0000000000cc".into(),
+        cwd: proj.to_string_lossy().into_owned(),
+        transcript: None,
+        title_hint: Some("Exact Codex".into()),
+        pid: 99992,
+        pid_start_us: 100,
+        boot_id: "boot-old".into(),
+        best_guess: false,
+        now: 1001,
+    })
+    .unwrap();
+    reg.set_pinned("codex:019a0000-0000-7000-8000-0000000000cc", true)
+        .unwrap();
+    drop(reg);
+
+    let bin = env!("CARGO_BIN_EXE_restowa");
+
+    // 1. Human-readable `restore --dry-run` shows `(best guess)` next to the best-guess item only
+    let dry = std::process::Command::new(bin)
+        .args([
+            "restore",
+            "opencode:ses_guess_1",
+            "codex:019a0000-0000-7000-8000-0000000000cc",
+            "--dry-run",
+        ])
+        .env("HOME", &env.home)
+        .output()
+        .unwrap();
+    assert!(dry.status.success());
+    let stdout = String::from_utf8_lossy(&dry.stdout);
+    let guess_line = stdout
+        .lines()
+        .find(|l| l.contains("opencode:ses_guess_1"))
+        .expect("opencode line present");
+    let exact_line = stdout
+        .lines()
+        .find(|l| l.contains("codex:019a0000-0000-7000-8000-0000000000cc"))
+        .expect("codex line present");
+    assert!(
+        guess_line.contains("(best guess)"),
+        "expected `(best guess)` in dry-run line: {guess_line}"
+    );
+    assert!(
+        !exact_line.contains("(best guess)"),
+        "unexpected `(best guess)` on exact line: {exact_line}"
+    );
+
+    // 2. JSON `restore --dry-run --json` includes `"best_guess"` boolean
+    let dry_json = std::process::Command::new(bin)
+        .args([
+            "restore",
+            "opencode:ses_guess_1",
+            "codex:019a0000-0000-7000-8000-0000000000cc",
+            "--dry-run",
+            "--json",
+        ])
+        .env("HOME", &env.home)
+        .output()
+        .unwrap();
+    assert!(dry_json.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&dry_json.stdout).unwrap();
+    let items = report["restored"].as_array().unwrap();
+    let oc_item = items
+        .iter()
+        .find(|i| i["key"] == "opencode:ses_guess_1")
+        .unwrap();
+    let cx_item = items
+        .iter()
+        .find(|i| i["key"] == "codex:019a0000-0000-7000-8000-0000000000cc")
+        .unwrap();
+    assert_eq!(oc_item["best_guess"], true);
+    assert_eq!(cx_item["best_guess"], false);
+
+    // 3. `list --pinned --json` returns only the pinned session
+    let pinned_out = std::process::Command::new(bin)
+        .args(["list", "--pinned", "--json"])
+        .env("HOME", &env.home)
+        .output()
+        .unwrap();
+    assert!(pinned_out.status.success());
+    let pinned: serde_json::Value = serde_json::from_slice(&pinned_out.stdout).unwrap();
+    let arr = pinned.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["key"], "codex:019a0000-0000-7000-8000-0000000000cc");
 }
