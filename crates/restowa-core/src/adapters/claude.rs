@@ -412,15 +412,11 @@ mod tests {
     #[test]
     fn encode_project_dir_matches_observed_claude_behavior() {
         assert_eq!(
-            ClaudeAdapter::encode_project_dir(
-                "/Users/dev/Developer/Personal/example.com"
-            ),
+            ClaudeAdapter::encode_project_dir("/Users/dev/Developer/Personal/example.com"),
             "-Users-dev-Developer-Personal-example-com"
         );
         assert_eq!(
-            ClaudeAdapter::encode_project_dir(
-                "/Users/dev/Developer/Side Projects/demo-app"
-            ),
+            ClaudeAdapter::encode_project_dir("/Users/dev/Developer/Side Projects/demo-app"),
             "-Users-dev-Developer-Side-Projects-demo-app"
         );
     }

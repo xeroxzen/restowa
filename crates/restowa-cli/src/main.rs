@@ -508,26 +508,38 @@ fn maybe_escape_bin(bin: &str) -> String {
 
 fn resolve_launchd_binary_path(explicit: Option<&str>) -> Result<std::path::PathBuf> {
     if let Some(bin) = explicit {
-        let p = std::path::PathBuf::from(bin);
-        if p.exists() {
-            return Ok(p.canonicalize()?);
-        }
-        return Ok(p);
+        return Ok(absolute_keeping_symlinks(std::path::Path::new(bin)));
     }
-    // Prefer an installed binary on PATH that does not live in target/.
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("restowa");
-            if candidate.is_file() {
-                let resolved = candidate.canonicalize().unwrap_or(candidate);
-                if !path_points_into_target(&resolved.to_string_lossy()) {
-                    return Ok(resolved);
-                }
-            }
-        }
+    if let Some(found) = std::env::var_os("PATH").and_then(|p| find_installed_on_path(&p)) {
+        return Ok(found);
     }
     let exe = std::env::current_exe().context("failed to determine current executable path")?;
     Ok(exe.canonicalize().unwrap_or(exe))
+}
+
+/// First `restowa` on `path_var` that does not live in a cargo `target/` dir.
+fn find_installed_on_path(path_var: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join("restowa"))
+        .filter(|candidate| candidate.is_file())
+        .find(|candidate| {
+            let resolved = candidate
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.clone());
+            !path_points_into_target(&resolved.to_string_lossy())
+        })
+        .map(|candidate| absolute_keeping_symlinks(&candidate))
+}
+
+/// Absolute paths are kept as given. Canonicalising would turn Homebrew's
+/// stable `bin/restowa` symlink into a versioned Cellar path that the next
+/// `brew upgrade` deletes, silently breaking the launchd agent. Relative
+/// paths are canonicalised because launchd needs an absolute one.
+fn absolute_keeping_symlinks(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn cmd_install(paths: &AppPaths, config: &Config, args: &InstallArgs, json: bool) -> Result<u8> {
@@ -748,5 +760,51 @@ fn cmd_config(paths: &AppPaths, config: &Config, args: &ConfigArgs, json: bool) 
             }
             Ok(EXIT_OK)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("restowa-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // Leftover from an earlier run, if any.
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn path_lookup_keeps_homebrew_symlink_instead_of_cellar_path() {
+        let root = scratch_dir("brew");
+        let cellar_bin = root.join("Cellar/restowa/0.1.0/bin");
+        let brew_bin = root.join("bin");
+        std::fs::create_dir_all(&cellar_bin).unwrap();
+        std::fs::create_dir_all(&brew_bin).unwrap();
+        std::fs::write(cellar_bin.join("restowa"), b"").unwrap();
+        symlink(cellar_bin.join("restowa"), brew_bin.join("restowa")).unwrap();
+
+        let found = find_installed_on_path(brew_bin.as_os_str());
+        assert_eq!(found, Some(brew_bin.join("restowa")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn path_lookup_skips_cargo_target_dirs() {
+        let root = scratch_dir("target");
+        let target_bin = root.join("target/release");
+        let installed = root.join("installed");
+        std::fs::create_dir_all(&target_bin).unwrap();
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::write(target_bin.join("restowa"), b"").unwrap();
+        std::fs::write(installed.join("restowa"), b"").unwrap();
+
+        let path_var = std::env::join_paths([&target_bin, &installed]).unwrap();
+        assert_eq!(
+            find_installed_on_path(&path_var),
+            Some(installed.join("restowa"))
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

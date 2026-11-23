@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# Builds build/Restowa.app from the SwiftPM package. Needs only the Xcode
-# Command Line Tools. Signs ad-hoc unless CODESIGN_IDENTITY is set.
+# Builds build/Restowa.app from the SwiftPM package with the Xcode Command
+# Line Tools alone.
+#
+# Signing:
+#   default                  ad-hoc (local use only; Gatekeeper rejects it elsewhere)
+#   CODESIGN_IDENTITY="Developer ID Application: Name (TEAMID)"
+#                            hardened runtime + entitlements + secure timestamp,
+#                            ready for notarize.sh
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -15,7 +21,13 @@ cp "$bin_dir/Restowa" "$app/Contents/MacOS/Restowa"
 cp Resources/Info.plist "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 
-codesign --force --sign "${CODESIGN_IDENTITY:--}" "$app"
-codesign --verify --strict "$app"
+identity="${CODESIGN_IDENTITY:--}"
+if [[ "$identity" == "-" ]]; then
+    codesign --force --sign - "$app"
+else
+    codesign --force --sign "$identity" --options runtime --timestamp \
+        --entitlements Resources/Restowa.entitlements "$app"
+fi
+codesign --verify --strict --verbose=1 "$app"
 
 echo "$app"

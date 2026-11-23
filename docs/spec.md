@@ -60,7 +60,7 @@ Rust for the core and CLI, SwiftUI for the menu bar app; no async runtime, no El
 | Paths | `directories` |  |
 | Errors | `anyhow` (bin), `thiserror` (core) |  |
 | Logging | `log` + a tiny file logger | Log to `~/Library/Logs/restowa/restowa.log`, rotate at 1 MB |
-| UI | SwiftUI `MenuBarExtra`, macOS 13+ | Reads SQLite read-only; calls the CLI for writes |
+| UI | SwiftUI `MenuBarExtra`, macOS 14+ | Calls the CLI for every read and write; never opens SQLite |
 
 **Not allowed without a written reason:** `tokio` or any async runtime, `reqwest` or any network crate, `sysinfo` (use `libproc` first).
 
@@ -370,11 +370,12 @@ Ship in six phases; each ends with something Andile uses daily, and nothing star
 - [ ] Launch at login works; idle RSS ≤ 40 MB
 - [ ] No work happens while the menu is closed (verified in Activity Monitor)
 
-**Phase 5: Polish and distribution**
+**Phase 5: Polish and distribution** — *In progress (see `docs/releasing.md`)*
 
-- [ ] Titles from first prompt; pin, rename and forget in CLI and UI
-- [ ] Homebrew tap `brew install xeroxzen/tap/restowa`; signed and notarised app
-- [ ] README with a 30-second GIF
+- [ ] Titles from first prompt; pin, rename and forget in CLI and UI *(done in CLI and app; ticks with the Phase 4 UI check)*
+- [ ] Homebrew tap `brew install xeroxzen/tap/restowa` *(tap published; needs a clean `brew install` check)*
+- [ ] Signed and notarised app *(scripts ready: `build-app.sh` with `CODESIGN_IDENTITY`, `notarize.sh`; needs a Developer ID certificate)*
+- [ ] README with a 30-second GIF *(README done; GIF after the Phase 4 UI check)*
 
 ## Risks
 

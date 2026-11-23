@@ -188,10 +188,7 @@ mod tests {
     #[test]
     fn file_uri_to_path_decodes_spaces() {
         assert_eq!(
-            file_uri_to_path(
-                "file:///Users/dev/Developer/Side%20Projects/demo-app"
-            )
-            .as_deref(),
+            file_uri_to_path("file:///Users/dev/Developer/Side%20Projects/demo-app").as_deref(),
             Some("/Users/dev/Developer/Side Projects/demo-app")
         );
     }
