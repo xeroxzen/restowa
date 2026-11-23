@@ -2,3 +2,5 @@
 .DS_Store
 *.swp
 *.swo
+/apps/macos/Restowa/.build
+/apps/macos/Restowa/build

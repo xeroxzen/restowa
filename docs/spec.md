@@ -364,7 +364,7 @@ Ship in six phases; each ends with something Andile uses daily, and nothing star
 - [x] Two Codex sessions in the same folder resolve to the correct IDs
 - [x] Ambiguous matches are flagged as best guesses
 
-**Phase 4: Menu bar app**
+**Phase 4: Menu bar app** — *Built; awaiting manual UI verification (see `docs/phase4.md`)*
 
 - [ ] Shows Open now, Last boot and Pinned; restore works from a row and from the header button
 - [ ] Launch at login works; idle RSS ≤ 40 MB
