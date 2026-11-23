@@ -19,7 +19,9 @@ The agent CLIs already save sessions to disk. What a restart loses is the set of
 ## Install
 
 ```sh
-brew install xeroxzen/tap/restowa
+brew tap xeroxzen/tap
+brew trust --formula xeroxzen/tap/restowa   # Homebrew 7+ asks you to trust third-party taps
+brew install restowa
 restowa install --all
 restowa doctor
 ```
