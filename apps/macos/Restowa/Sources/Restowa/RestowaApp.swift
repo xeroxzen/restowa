@@ -49,6 +49,10 @@ final class MenuState {
     var editingKey: String?
     var editMode = RowMode.normal
     var draftTitle = ""
+    /// Natural height of the session list. The panel sizes to its content's
+    /// ideal size and a ScrollView's ideal height is near zero, so the list
+    /// is measured and the ScrollView is given this height (capped).
+    var listHeight: CGFloat = 0
 
     func mode(for key: String) -> RowMode {
         editingKey == key ? editMode : .normal

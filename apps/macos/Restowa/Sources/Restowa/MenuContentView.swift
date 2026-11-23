@@ -2,6 +2,8 @@ import RestowaKit
 import SwiftUI
 
 struct MenuContentView: View {
+    static let maxListHeight: CGFloat = 460
+
     let model: AppModel
     let settings: SettingsStore
     @Bindable var ui: MenuState
@@ -26,8 +28,9 @@ struct MenuContentView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { ui.listHeight = $0 }
             }
-            .frame(maxHeight: 460)
+            .frame(height: min(ui.listHeight, Self.maxListHeight))
             Divider()
             footer
         }

@@ -8,6 +8,7 @@ struct SettingsView: View {
 
     let vm: SettingsModel
     @Bindable var settings: SettingsStore
+    @FocusState private var pathFieldFocused: Bool
 
     var body: some View {
         Form {
@@ -32,6 +33,7 @@ struct SettingsView: View {
             Section("restowa binary") {
                 TextField("Path override", text: $settings.binaryOverride,
                           prompt: Text("Auto-detect"))
+                    .focused($pathFieldFocused)
                 LabeledContent("Using", value: settings.resolvedBinaryPath ?? "not found")
                     .foregroundStyle(settings.resolvedBinaryPath == nil ? .orange : .secondary)
             }
@@ -43,6 +45,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 460)
         .frame(minHeight: 520)
+        .defaultFocus($pathFieldFocused, false)
         .task { await vm.load() }
     }
 
