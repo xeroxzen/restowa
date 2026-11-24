@@ -36,7 +36,7 @@ jobs:
             target/aarch64-apple-darwin/release/restowa \
             target/x86_64-apple-darwin/release/restowa
           codesign --force --sign - dist/restowa
-          lipo -verify_arch dist/restowa arm64 x86_64
+          for arch in arm64 x86_64; do lipo dist/restowa -verify_arch "$arch"; done
           test "$(dist/restowa --version)" = "restowa ${TAG#v}"
           cp LICENSE README.md dist/
           name="restowa-${TAG}-macos-universal.tar.gz"
