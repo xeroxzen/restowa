@@ -12,10 +12,11 @@ use restowa_core::logging::init_file_logger;
 use restowa_core::model::{Session, SessionStatus, Tool};
 use restowa_core::paths::AppPaths;
 use restowa_core::platform::{current_platform, Platform};
-use restowa_core::registry::Registry;
+use restowa_core::registry::{resolve_key_in_slice, Registry};
 use restowa_core::restore::{run_restore, RestoreOptions};
 use restowa_core::scanner::{load_merged_sessions, run_scan};
 use restowa_core::shell::shell_escape;
+use restowa_core::terminal::select_backend;
 use std::io::Read;
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,6 +58,8 @@ enum Commands {
     Rename { key: String, title: String },
     /// Hide a session from restowa (never deletes tool data)
     Forget { key: String },
+    /// Bring a running session's Ghostty or Terminal.app tab to the front
+    Focus { key: String },
     /// Install hooks and/or launchd agent
     Install(InstallArgs),
     /// Reverse install (keeps registry unless --purge)
@@ -249,6 +252,7 @@ fn run(cli: Cli) -> Result<u8> {
             reg.set_hidden(k, true)?;
             Ok("forgotten")
         }),
+        Commands::Focus { key } => cmd_focus(&paths, &platform, &key, cli.json),
         Commands::Install(args) => cmd_install(&paths, &config, &args, cli.json),
         Commands::Uninstall(args) => cmd_uninstall(&paths, &args, cli.json),
         Commands::Doctor => cmd_doctor(&paths, &platform, cli.json),
@@ -474,6 +478,38 @@ where
         println!("{action}: {}", session.key);
     }
     Ok(EXIT_OK)
+}
+
+fn cmd_focus(paths: &AppPaths, platform: &dyn Platform, key: &str, json: bool) -> Result<u8> {
+    let sessions = load_merged_sessions(paths, platform, false)?;
+    let session = resolve_key_in_slice(&sessions, key)?;
+    if session.status != SessionStatus::Live {
+        anyhow::bail!(
+            "{} is not running; reopen it with `restowa restore {}`",
+            session.key,
+            session.key
+        );
+    }
+    let pid = session
+        .pid
+        .context("running session has no recorded process")?;
+    let tty = platform
+        .process_tty(pid as i32)
+        .with_context(|| format!("process {pid} has no terminal"))?;
+    for name in ["ghostty", "terminal"] {
+        let backend = select_backend(name, paths)?;
+        if !backend.focus_tty(&tty)? {
+            continue;
+        }
+        if json {
+            let out = serde_json::json!({ "key": session.key, "terminal": name, "tty": tty });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        } else {
+            println!("focused: {} ({name}, {tty})", session.key);
+        }
+        return Ok(EXIT_OK);
+    }
+    anyhow::bail!("no Ghostty or Terminal.app tab found for {tty}")
 }
 
 fn resolve_hook_command_bin(explicit: Option<&str>) -> String {

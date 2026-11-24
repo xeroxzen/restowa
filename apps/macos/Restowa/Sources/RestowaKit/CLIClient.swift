@@ -54,6 +54,12 @@ public struct CLIClient: Sendable {
     public func unpin(_ key: String) async throws { try await mutate(["unpin", "--", key]) }
     public func forget(_ key: String) async throws { try await mutate(["forget", "--", key]) }
 
+    /// Long timeout: the first call waits on the macOS Automation prompt.
+    public func focus(_ key: String) async throws {
+        let args = ["focus", "--", key]
+        try Self.check(try await invoke(args, timeout: 120), args: args)
+    }
+
     public func rename(_ key: String, title: String) async throws {
         try await mutate(["rename", "--", key, title])
     }

@@ -38,6 +38,7 @@ enum RowMode: Equatable {
     case normal
     case renaming
     case confirmingForget
+    case confirmingOpen
 }
 
 /// Transient UI state for the menu panel. Only one row is edited at a time.

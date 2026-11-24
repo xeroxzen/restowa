@@ -54,6 +54,7 @@ struct SessionRow: View {
             case .normal: normalRow
             case .renaming: renameRow
             case .confirmingForget: forgetRow
+            case .confirmingOpen: openRow
             }
         }
         .padding(.vertical, 4)
@@ -99,13 +100,18 @@ struct SessionRow: View {
                 .help("Actions")
         }
         .contentShape(Rectangle())
+        .onTapGesture { ui.begin(.confirmingOpen, key: session.key) }
         .help("\(session.cwd)\n\(session.key)")
         .contextMenu { contextMenu }
     }
 
     @ViewBuilder private var contextMenu: some View {
-        Button("Restore") { model.restore(session) }
-            .disabled(session.status == .live || model.isRestoring)
+        if session.status == .live {
+            Button("Switch to Tab") { model.open(session) }
+        } else {
+            Button("Restore") { model.restore(session) }
+                .disabled(model.isRestoring)
+        }
         Button("Copy Resume Command") { model.copyResumeCommand(session) }
         Button("Reveal Folder in Finder") { model.revealInFinder(session) }
         Divider()
@@ -123,6 +129,23 @@ struct SessionRow: View {
                 .onExitCommand { ui.endEditing() }
             Button("Save", action: commitRename).controlSize(.small)
             Button("Cancel") { ui.endEditing() }.controlSize(.small)
+        }
+    }
+
+    private var openRow: some View {
+        let live = session.status == .live
+        return HStack(spacing: 6) {
+            Text("\(live ? "Switch to" : "Open") \u{201C}\(session.displayTitle)\u{201D}?")
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Button("Cancel") { ui.endEditing() }.controlSize(.small)
+            Button(live ? "Switch" : "Open") {
+                ui.endEditing()
+                model.open(session)
+            }
+            .controlSize(.small)
+            .keyboardShortcut(.defaultAction)
+            .disabled(!live && model.isRestoring)
         }
     }
 

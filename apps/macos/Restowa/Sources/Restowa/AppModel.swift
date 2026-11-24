@@ -99,6 +99,21 @@ final class AppModel {
         restore { try await $0.restore(keys: [session.key]) }
     }
 
+    /// Switches to a running session's tab, or reopens a closed one.
+    func open(_ session: Session) {
+        guard session.status == .live else {
+            restore(session)
+            return
+        }
+        Task {
+            do {
+                try await client().focus(session.key)
+            } catch {
+                status = StatusLine(text: error.localizedDescription, isError: true)
+            }
+        }
+    }
+
     private func restore(_ op: @escaping @MainActor (CLIClient) async throws -> RestoreReport) {
         guard !isRestoring else { return }
         isRestoring = true

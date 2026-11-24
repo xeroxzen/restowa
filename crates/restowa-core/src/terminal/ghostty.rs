@@ -2,7 +2,7 @@ use crate::error::{CoreError, Result};
 use crate::model::{ProjectGroup, RestoreReport};
 use crate::paths::AppPaths;
 use crate::shell::applescript_escape;
-use crate::terminal::TerminalBackend;
+use crate::terminal::{run_osascript, TerminalBackend};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -76,6 +76,20 @@ impl GhosttyBackend {
         script.push_str("end tell\n");
         script
     }
+
+    pub fn build_focus_applescript(tty: &str) -> String {
+        let tty = applescript_escape(tty);
+        format!(
+            "if application \"Ghostty\" is not running then return \"missing\"\n\
+             tell application \"Ghostty\"\n\
+             \x20   set matches to every terminal whose tty is \"{tty}\"\n\
+             \x20   if (count of matches) is 0 then return \"missing\"\n\
+             \x20   focus item 1 of matches\n\
+             \x20   activate\n\
+             end tell\n\
+             return \"ok\"\n"
+        )
+    }
 }
 
 impl TerminalBackend for GhosttyBackend {
@@ -148,6 +162,14 @@ impl TerminalBackend for GhosttyBackend {
         }
         Ok(report)
     }
+
+    fn focus_tty(&self, tty: &str) -> Result<bool> {
+        if !self.available() {
+            return Ok(false);
+        }
+        let out = run_osascript(self.name(), &Self::build_focus_applescript(tty))?;
+        Ok(out == "ok")
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +177,15 @@ mod tests {
     use super::*;
     use crate::model::{RestoreItem, Tool};
     use crate::shell::{build_tab_command, expand_resume_template};
+
+    #[test]
+    fn focus_script_targets_the_tty_and_never_launches_ghostty() {
+        let script = GhosttyBackend::build_focus_applescript("/dev/ttys004");
+        assert!(script.starts_with("if application \"Ghostty\" is not running then return"));
+        assert!(script.contains("every terminal whose tty is \"/dev/ttys004\""));
+        assert!(script.contains("focus item 1 of matches"));
+        assert!(GhosttyBackend::build_focus_applescript("a\"b").contains("tty is \"a\\\"b\""));
+    }
 
     #[test]
     fn builds_one_window_per_group_and_tabs_for_extra_sessions() {

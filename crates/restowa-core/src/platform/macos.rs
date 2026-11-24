@@ -42,6 +42,7 @@ extern "C" {
         newlen: usize,
     ) -> c_int;
     fn getppid() -> i32;
+    fn devname(dev: i32, kind: u16) -> *const std::ffi::c_char;
     fn proc_pidinfo(
         pid: c_int,
         flavor: c_int,
@@ -140,6 +141,27 @@ impl Platform for MacOsPlatform {
     fn parent_pid(&self) -> i32 {
         // SAFETY: `getppid` is always safe to call.
         unsafe { getppid() }
+    }
+
+    fn process_tty(&self, pid: i32) -> Option<String> {
+        const NODEV: u32 = u32::MAX;
+        const S_IFCHR: u16 = 0o020000;
+        let bsd = pidinfo::<BSDInfo>(pid, 0).ok()?;
+        if bsd.e_tdev == NODEV {
+            return None;
+        }
+        // SAFETY: `devname` returns NULL or a NUL-terminated string in a static
+        // buffer that stays valid until the next call; it is copied right away.
+        let raw = unsafe { devname(bsd.e_tdev as i32, S_IFCHR) };
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` is non-null and NUL-terminated (see above).
+        let name = unsafe { CStr::from_ptr(raw) }.to_str().ok()?;
+        if name.is_empty() || name == "??" {
+            return None;
+        }
+        Some(format!("/dev/{name}"))
     }
 }
 

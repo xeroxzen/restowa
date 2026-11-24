@@ -1,7 +1,7 @@
 use crate::error::{CoreError, Result};
 use crate::model::{ProjectGroup, RestoreReport};
 use crate::shell::applescript_escape;
-use crate::terminal::TerminalBackend;
+use crate::terminal::{run_osascript, TerminalBackend};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -27,6 +27,27 @@ impl TerminalAppBackend {
         }
         script.push_str("end tell\n");
         script
+    }
+
+    /// Loops are bounded by the window and tab counts.
+    pub fn build_focus_applescript(tty: &str) -> String {
+        let tty = applescript_escape(tty);
+        format!(
+            "if application \"Terminal\" is not running then return \"missing\"\n\
+             tell application \"Terminal\"\n\
+             \x20   repeat with w in windows\n\
+             \x20       repeat with t in tabs of w\n\
+             \x20           if tty of t is \"{tty}\" then\n\
+             \x20               set selected of t to true\n\
+             \x20               set index of w to 1\n\
+             \x20               activate\n\
+             \x20               return \"ok\"\n\
+             \x20           end if\n\
+             \x20       end repeat\n\
+             \x20   end repeat\n\
+             end tell\n\
+             return \"missing\"\n"
+        )
     }
 }
 
@@ -99,5 +120,27 @@ impl TerminalBackend for TerminalAppBackend {
             report.restored.extend(group.items.iter().cloned());
         }
         Ok(report)
+    }
+
+    fn focus_tty(&self, tty: &str) -> Result<bool> {
+        if !self.available() {
+            return Ok(false);
+        }
+        let out = run_osascript(self.name(), &Self::build_focus_applescript(tty))?;
+        Ok(out == "ok")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_script_selects_matching_tab_and_never_launches_terminal() {
+        let script = TerminalAppBackend::build_focus_applescript("/dev/ttys004");
+        assert!(script.starts_with("if application \"Terminal\" is not running then return"));
+        assert!(script.contains("if tty of t is \"/dev/ttys004\" then"));
+        assert!(script.contains("set selected of t to true"));
+        assert!(script.trim_end().ends_with("return \"missing\""));
     }
 }

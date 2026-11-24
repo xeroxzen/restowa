@@ -17,6 +17,11 @@ pub trait Platform {
     fn process_open_files(&self, pid: i32) -> Vec<PathBuf>;
     fn parent_pid(&self) -> i32;
 
+    /// Controlling terminal of `pid` (e.g. `/dev/ttys004`), if it has one.
+    fn process_tty(&self, _pid: i32) -> Option<String> {
+        None
+    }
+
     /// Stream processes one at a time to keep peak RSS low during scans.
     fn for_each_process(&self, f: &mut dyn FnMut(&ProcInfo)) -> Result<usize> {
         let procs = self.list_processes()?;
