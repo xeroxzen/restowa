@@ -99,17 +99,27 @@ pub fn run_doctor(paths: &AppPaths, platform: &dyn Platform) -> DoctorReport {
     //    DB checks strictly honor the `immutable=1` guard.
     let claude_sessions_dir = paths.claude_sessions_dir();
     let claude_adapter = ClaudeAdapter::new(paths.clone());
-    let mut live_claude_pids: Vec<i32> = Vec::new();
+    let mut live_claude_procs: Vec<(i32, i64)> = Vec::new();
     let mut running_tools: HashSet<Tool> = HashSet::new();
-    let _ = platform.for_each_process(&mut |p| {
+    let listed = platform.for_each_process(&mut |p| {
         if let Some(tool) = owning_tool_of_process(p) {
             running_tools.insert(tool);
         }
         if claude_adapter.matches_process(p) {
             running_tools.insert(Tool::Claude);
-            live_claude_pids.push(p.pid);
+            live_claude_procs.push((p.pid, p.start_time_us));
         }
     });
+    if let Err(e) = listed {
+        // Which tools are running is unknown, so assume all are: the schema
+        // checks below must never open a live database with `immutable=1`.
+        running_tools.extend(Tool::ALL);
+        checks.push(DoctorCheck {
+            name: "processes".to_string(),
+            status: CheckStatus::Error,
+            detail: format!("could not list processes: {e}"),
+        });
+    }
 
     if !claude_sessions_dir.is_dir() {
         checks.push(DoctorCheck {
@@ -121,11 +131,15 @@ pub fn run_doctor(paths: &AppPaths, platform: &dyn Platform) -> DoctorReport {
             ),
         });
     } else {
-        let missing_pids: Vec<i32> = live_claude_pids
-            .iter()
-            .copied()
-            .filter(|&pid| !claude_adapter.has_pid_session_file(pid))
-            .collect();
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros() as i64);
+        let missing_pids = claude_pids_missing_session_files(
+            &claude_adapter,
+            platform,
+            &live_claude_procs,
+            now_us,
+        );
         let any_json = std::fs::read_dir(&claude_sessions_dir)
             .ok()
             .into_iter()
@@ -143,7 +157,7 @@ pub fn run_doctor(paths: &AppPaths, platform: &dyn Platform) -> DoctorReport {
                     missing_pids
                 ),
             });
-        } else if !any_json && live_claude_pids.is_empty() {
+        } else if !any_json && live_claude_procs.is_empty() {
             checks.push(DoctorCheck {
                 name: "claude:pid-files".to_string(),
                 status: CheckStatus::Warn,
@@ -159,7 +173,7 @@ pub fn run_doctor(paths: &AppPaths, platform: &dyn Platform) -> DoctorReport {
                 detail: format!(
                     "{} present ({} live Claude process(es) matched)",
                     claude_sessions_dir.display(),
-                    live_claude_pids.len()
+                    live_claude_procs.len()
                 ),
             });
         }
@@ -294,6 +308,32 @@ pub fn run_doctor(paths: &AppPaths, platform: &dyn Platform) -> DoctorReport {
     }
 }
 
+/// Claude writes its PID file during startup, and short-lived `claude`
+/// invocations can exit before writing one.
+const PID_FILE_GRACE_US: i64 = 10_000_000;
+
+/// Claude processes without a PID file, ignoring those younger than
+/// `PID_FILE_GRACE_US` and those that exited (or whose PID was reused)
+/// since `procs` was collected.
+fn claude_pids_missing_session_files(
+    adapter: &ClaudeAdapter,
+    platform: &dyn Platform,
+    procs: &[(i32, i64)],
+    now_us: i64,
+) -> Vec<i32> {
+    procs
+        .iter()
+        .filter(|&&(_, start)| now_us.saturating_sub(start) >= PID_FILE_GRACE_US)
+        .filter(|&&(pid, _)| !adapter.has_pid_session_file(pid))
+        .filter(|&&(pid, start)| {
+            platform
+                .process_info(pid)
+                .is_some_and(|p| p.start_time_us == start)
+        })
+        .map(|&(pid, _)| pid)
+        .collect()
+}
+
 fn find_executable(name: &str, fallbacks: &[PathBuf]) -> Option<PathBuf> {
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
@@ -362,6 +402,91 @@ mod tests {
         fn parent_pid(&self) -> i32 {
             1
         }
+    }
+
+    struct FixedPlatform(Vec<ProcInfo>);
+    impl Platform for FixedPlatform {
+        fn boot_id(&self) -> Result<String> {
+            Ok("100.000001".into())
+        }
+        fn list_processes(&self) -> Result<Vec<ProcInfo>> {
+            Ok(self.0.clone())
+        }
+        fn process_info(&self, pid: i32) -> Option<ProcInfo> {
+            self.0.iter().find(|p| p.pid == pid).cloned()
+        }
+        fn process_open_files(&self, _pid: i32) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        fn parent_pid(&self) -> i32 {
+            1
+        }
+    }
+
+    struct FailingPlatform;
+    impl Platform for FailingPlatform {
+        fn boot_id(&self) -> Result<String> {
+            Ok("100.000001".into())
+        }
+        fn list_processes(&self) -> Result<Vec<ProcInfo>> {
+            Err(crate::error::CoreError::Platform("listing denied".into()))
+        }
+        fn process_info(&self, _pid: i32) -> Option<ProcInfo> {
+            None
+        }
+        fn process_open_files(&self, _pid: i32) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        fn parent_pid(&self) -> i32 {
+            1
+        }
+    }
+
+    #[test]
+    fn doctor_reports_an_error_when_processes_cannot_be_listed() {
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+        let report = run_doctor(&paths, &FailingPlatform);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "processes")
+            .expect("processes check");
+        assert_eq!(check.status, CheckStatus::Error);
+        assert!(check.detail.contains("listing denied"));
+        assert!(report.has_errors);
+    }
+
+    #[test]
+    fn pid_file_check_ignores_young_exited_and_reused_processes() {
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+        std::fs::create_dir_all(paths.claude_sessions_dir()).unwrap();
+        std::fs::write(paths.claude_sessions_dir().join("40.json"), "{}").unwrap();
+        let adapter = ClaudeAdapter::new(paths);
+
+        let now = 100_000_000;
+        let old = now - PID_FILE_GRACE_US;
+        let proc_at = |pid: i32, start: i64| ProcInfo {
+            pid,
+            ppid: 1,
+            start_time_us: start,
+            exe_path: None,
+            argv: vec!["claude".into()],
+            cwd: None,
+        };
+        // 10: old, running, no file. 20: just started. 30: exited.
+        // 40: has a file. 50: PID reused by a newer process.
+        let platform = FixedPlatform(vec![
+            proc_at(10, old),
+            proc_at(20, now - 1),
+            proc_at(40, old),
+            proc_at(50, old + 1),
+        ]);
+        let seen = [(10, old), (20, now - 1), (30, old), (40, old), (50, old)];
+
+        let missing = claude_pids_missing_session_files(&adapter, &platform, &seen, now);
+        assert_eq!(missing, vec![10]);
     }
 
     #[test]

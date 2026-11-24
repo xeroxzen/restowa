@@ -13,6 +13,8 @@ pub enum Tool {
 }
 
 impl Tool {
+    pub const ALL: [Tool; 4] = [Tool::Claude, Tool::Codex, Tool::Opencode, Tool::Antigravity];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Tool::Claude => "claude",
