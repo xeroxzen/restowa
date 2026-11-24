@@ -1,8 +1,8 @@
 class Restowa < Formula
   desc "Restore AI coding-agent sessions after a macOS restart"
   homepage "https://github.com/xeroxzen/restowa"
-  url "https://github.com/xeroxzen/restowa/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "884f84767b9b279b317e1f2a831e10a86aca37b37c4a485e9e79532bc8391cbc"
+  url "https://github.com/xeroxzen/restowa/archive/refs/tags/v0.1.2.tar.gz"
+  sha256 "41ae7cd5c3c1df1603bce9f92786ec8fdee32968a764578e9a27c6d5fa798872"
   license "MIT"
   head "https://github.com/xeroxzen/restowa.git", branch: "main"
 
