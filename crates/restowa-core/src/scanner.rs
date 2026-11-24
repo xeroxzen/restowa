@@ -229,8 +229,10 @@ pub fn load_merged_sessions(
         .unwrap_or(0);
     let boot_id = platform.boot_id().ok();
 
+    // Hidden rows are loaded too: a forgotten session that is still running
+    // would otherwise be rediscovered below as a new, visible session.
     let db_sessions = match Registry::open_read_only(&paths.registry_db)? {
-        Some(reg) => reg.list_all(include_hidden)?,
+        Some(reg) => reg.list_all(true)?,
         None => Vec::new(),
     };
 
@@ -378,6 +380,46 @@ mod tests {
         fn parent_pid(&self) -> i32 {
             1
         }
+    }
+
+    #[test]
+    fn forgotten_live_session_stays_hidden_in_merged_list() {
+        let home = TestHome::new();
+        let paths = AppPaths::from_home(home.0.clone());
+        std::fs::create_dir_all(paths.claude_sessions_dir()).unwrap();
+        let sid = "forget-me-live";
+        std::fs::write(
+            paths.claude_sessions_dir().join("5150.json"),
+            format!(r#"{{"pid":5150,"sessionId":"{sid}","cwd":"/tmp/app","kind":"interactive"}}"#),
+        )
+        .unwrap();
+        let platform = MockPlatform {
+            boot_id: "boot-1".into(),
+            procs: vec![ProcInfo {
+                pid: 5150,
+                ppid: 1,
+                start_time_us: 100,
+                exe_path: None,
+                argv: vec!["claude".into()],
+                cwd: Some(PathBuf::from("/tmp/app")),
+            }],
+        };
+        run_scan(&paths, &platform).unwrap();
+        let key = format!("claude:{sid}");
+        let listed = |hidden: bool| {
+            load_merged_sessions(&paths, &platform, hidden)
+                .unwrap()
+                .into_iter()
+                .any(|s| s.key == key)
+        };
+        assert!(listed(false));
+
+        let mut reg = Registry::open(&paths.registry_db).unwrap();
+        reg.set_hidden(&key, true).unwrap();
+        drop(reg);
+
+        assert!(!listed(false));
+        assert!(listed(true));
     }
 
     #[test]
