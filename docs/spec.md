@@ -184,6 +184,7 @@ Every command supports `--json` for the menu bar app and scripts. Exit codes: 0 
 | --- | --- |
 | `restowa list [--live \| --last-boot \| --pinned \| --all] [--tool T] [--json]` | Table of sessions: short ID, tool, project (cwd basename), title, status, last seen. Default `--live` |
 | `restowa restore [KEY...] [--last-boot] [--terminal ghostty\|terminal\|iterm] [--dry-run]` | Opens one tab per session. `--dry-run` prints the commands only |
+| `restowa focus KEY` | Bring a running session's tab to the front: reads the process's tty and selects the Ghostty or Terminal.app tab with that tty. Never launches either app |
 | `restowa scan` | One scan pass (what launchd runs). Silent unless `-v` |
 | `restowa hook claude <session-start\|session-end>` | Reads hook JSON from stdin, upserts the session. Must finish in < 50 ms and always exit 0 so it never blocks Claude Code |
 | `restowa pin KEY` / `unpin KEY` | Always include in restore sets |
@@ -292,13 +293,15 @@ A thin SwiftUI `MenuBarExtra` built with SwiftPM plus a `.app` bundle build scri
 4. Section **Pinned**.
 5. Footer: search field, Settings, Quit.
 
-**Row actions (context menu):** Restore, Copy resume command, Reveal folder in Finder, Pin/Unpin, Rename, Forget.
+**Clicking a row** asks first, inline: “Switch to …?” for a running session (`restowa focus`) or “Open …?” for a closed one (`restowa restore`).
+
+**Row actions** (the ⋯ button on hover, or right-click): Switch to Tab (running) or Restore (closed), Copy resume command, Reveal folder in Finder, Pin/Unpin, Rename, Forget.
 
 **Settings:** default terminal backend, scan interval (1/2/5 min), launch at login (`SMAppService.mainApp`, falling back to a per-user LaunchAgent when running a locally/ad-hoc signed build), show tools (checkboxes), `restowa` binary path override, “Run doctor”.
 
 **Implementation rules**
 
-- Never read SQLite in Swift. When the menu opens, fetch sessions via `restowa list --live --json`, `restowa list --last-boot --json`, and `restowa list --pinned --json` through `Process`. Every write (`restore`, `pin`, `unpin`, `rename`, `forget`, `doctor`) goes through the CLI.
+- Never read SQLite in Swift. When the menu opens, fetch sessions via `restowa list --live --json`, `restowa list --last-boot --json`, and `restowa list --pinned --json` through `Process`. Every write or action (`restore`, `focus`, `pin`, `unpin`, `rename`, `forget`, `doctor`) goes through the CLI.
 - Refresh only while the menu is open: watch the registry file's modification time (`~/Library/Application Support/restowa/registry.db` and `-wal` via `DispatchSource`) strictly while open to trigger a CLI refresh; stop watching immediately when closed (zero polling or work while closed).
 - Zero third-party Swift packages (Foundation, SwiftUI, AppKit, ServiceManagement only).
 - Set `LSUIElement = true` in `Info.plist` (menu-bar-only agent app, no Dock icon).
@@ -366,14 +369,14 @@ Ship in six phases; each ends with something Andile uses daily, and nothing star
 
 **Phase 4: Menu bar app** — *Built; awaiting manual UI verification (see `docs/phase4.md`)*
 
-- [ ] Shows Open now, Last boot and Pinned; restore works from a row and from the header button
+- [ ] Shows Open now, Last boot and Pinned; restore works from a row and from the header button *(sections, restore from a row, switch to tab and forget verified 2026-11-24; header button needs a reboot)*
 - [ ] Launch at login works; idle RSS ≤ 40 MB
 - [ ] No work happens while the menu is closed (verified in Activity Monitor)
 
 **Phase 5: Polish and distribution** — *In progress (see `docs/releasing.md`)*
 
 - [ ] Titles from first prompt; pin, rename and forget in CLI and UI *(done in CLI and app; ticks with the Phase 4 UI check)*
-- [ ] Homebrew tap `brew install xeroxzen/tap/restowa` *(tap published; needs a clean `brew install` check)*
+- [x] Homebrew tap `brew install xeroxzen/tap/restowa` *(clean install 2026-11-23; upgrades through v0.1.3 verified)*
 - [ ] Signed and notarised app *(scripts ready: `build-app.sh` with `CODESIGN_IDENTITY`, `notarize.sh`; needs a Developer ID certificate)*
 - [ ] README with a 30-second GIF *(README done; GIF after the Phase 4 UI check)*
 

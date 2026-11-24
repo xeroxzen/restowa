@@ -45,6 +45,7 @@ cargo install --path crates/restowa-cli
 | `restowa restore --last-boot` | Reopen everything that was open before the last restart |
 | `restowa restore KEY...` | Reopen specific sessions. Keys accept any unique ID prefix |
 | `restowa restore --dry-run` | Print the commands without opening anything |
+| `restowa focus KEY` | Bring a running session's Ghostty or Terminal.app tab to the front |
 | `restowa pin KEY` / `unpin KEY` | Always include a session in restore sets |
 | `restowa rename KEY "title"` | Set a title (titles default to the first prompt) |
 | `restowa forget KEY` | Hide a session from restowa |
@@ -58,7 +59,7 @@ Restore opens tabs in **Ghostty** (default, needs 1.3+ with `macos-applescript` 
 
 ## Menu bar app
 
-`apps/macos/Restowa` is a small SwiftUI menu bar app: open sessions grouped by project, the last-boot set with a one-click restore, pinned sessions, search, and per-session actions. It has no logic of its own and calls the `restowa` CLI for everything.
+`apps/macos/Restowa` is a small SwiftUI menu bar app: open sessions grouped by project, the last-boot set with a one-click restore, pinned sessions, search, and per-session actions. Click a session to switch to its tab if it is running, or to reopen it if it is closed. It has no logic of its own and calls the `restowa` CLI for everything.
 
 Build it with the Xcode Command Line Tools (macOS 14+):
 

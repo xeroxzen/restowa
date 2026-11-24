@@ -25,6 +25,6 @@ Automating clicks on the menu bar item from a terminal didn't show the panel (li
 
 1. `apps/macos/Restowa/build-app.sh && open apps/macos/Restowa/build/Restowa.app`
 2. Panel shows Open now, Last boot, Pinned; restore works from a row and from the header button.
-3. Context menu: Restore, Copy Resume Command, Reveal in Finder, Pin/Unpin, Rename (inline), Forget (inline confirm).
+3. Clicking a row asks to switch to it (running, via `restowa focus`) or open it (closed). The ⋯ button and right-click menu: Switch to Tab or Restore, Copy Resume Command, Reveal in Finder, Pin/Unpin, Rename (inline), Forget (inline confirm).
 4. Settings: terminal and scan interval write through `restowa config set`; launch at login; Run doctor shows all checks ok.
 5. With the menu closed, Activity Monitor shows 0% CPU and no `restowa` child processes.
